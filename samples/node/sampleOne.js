@@ -1,0 +1,7 @@
+(function() {
+
+  namespace.one = {
+    hello: {}
+  };
+
+}());
