@@ -1,6 +1,6 @@
 {
   "name": "rejs",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "description": "Resolve JavaScript file order.",
   "main": "src/rejs.js",
   "repository": {
