@@ -27,7 +27,7 @@
 
   var tProto = Resolver.prototype;
 
-  tProto.resolve = function(pResources) {
+  tProto.resolve = function(pResources, pExports) {
     var tKeys = Object.keys(pResources);
     var i;
     var il = tKeys.length;
@@ -73,7 +73,7 @@
       }
     }
 
-    return this.sortStats(tUnsortedStats);
+    return this.sortStats(tUnsortedStats, pExports || null);
   };
 
   var mGlobalScopeASTCache = null;
@@ -208,7 +208,7 @@
     };
   }
 
-  tProto.sortStats = function(pUnsortedStats) {
+  tProto.sortStats = function(pUnsortedStats, pOnlyExportsList) {
     var i, j, jl;
     var il = pUnsortedStats.length;
     // The sorted node list. (L)
@@ -216,22 +216,26 @@
     var tStatsPackage;
     var tStats;
     var tExports;
+    var tExport;
     var tRequires;
     var tArray;
     var cExportMap = {};
     var cRequireMap = {};
     var tNode;
     var tStartNodes = [];
+    var tLastIL;
+    var tKeys;
 
     function Node(pPackage) {
       this.package = pPackage;
       this.visited = false;
     }
 
-    function visit(pNode) {
+    function visitDown(pNode) {
       var tRequireMap = cRequireMap;
       var i, il, j, jl;
       var tExports;
+      var tExport;
       var tRequiringNodes;
 
       if (pNode.visited === false) {
@@ -239,26 +243,53 @@
         tExports = pNode.package.stats.exports;
 
         for (i = 0, il = tExports.length; i < il; i++) {
-          tRequiringNodes = tRequireMap[tExports[i]];
+          tExport = tExports[i];
+          tRequiringNodes = tRequireMap[tExport];
 
           if (tRequiringNodes === void 0) {
             // Nobody requires this export. Skip.
             continue;
           }
 
-          delete tRequireMap[tExports[i]];
+          delete tRequireMap[tExport];
 
           /*
             for each node m with an edge from n to m do
                 visit(m)
            */
           for (j = 0, jl = tRequiringNodes.length; j < jl; j++) {
-            visit(tRequiringNodes[j]);
+            visitDown(tRequiringNodes[j]);
           }
+
+          delete cExportMap[tExport];
         }
 
         tSorted.push(pNode.package.key);
       }
+    }
+
+    function visitUp(pNode) {
+      if (pNode.visited === true) {
+        return;
+      }
+
+      pNode.visited = true;
+
+      var i, il, j, jl;
+      var tRequires = pNode.package.stats.requires;
+      var tRequiredNode;
+
+      for (i = 0, il = tRequires.length; i < il; i++) {
+        tRequiredNode = cExportMap[tRequires[i]];
+
+        if (!tRequiredNode) {
+          continue;
+        }
+
+        visitUp(tRequiredNode);
+      }
+
+      tSorted.push(pNode.package.key);
     }
 
     for (i = 0; i < il; i++) {
@@ -285,27 +316,88 @@
       }
 
       // This creates the S set.
-      if (tStats.requires.length === 0) {
+      if (!pOnlyExportsList && jl === 0) {
         tStartNodes.push(tNode);
       }
     }
 
-    /*
-      for each node n in S do
-        visit(n)
-     */
-    for (i = 0, il = tStartNodes.length; i < il; i++) {
-      visit(tStartNodes[i]);
-    }
+    if (!pOnlyExportsList) {
+      /*
+        for each node n in S do
+          visit(n)
+       */
 
-    if (Object.keys(cRequireMap).length > 0) {
-      this.log('UNRESOLVED REQUIREMENTS');
+      for (i = 0, il = tStartNodes.length; i < il; i++) {
+        visitDown(tStartNodes[i]);
+      }
+
+      // Next we try to visit nodes that
+      // require something but also
+      // export their own symbols.
+
+      tLastIL = 0;
+      tKeys = Object.keys(cExportMap);
+
+      il = tKeys.length;
+
+      while (il !== tLastIL) {
+        tLastIL = il;
+
+        for (i = il - 1; i >= 0; i--) {
+          tNode = cExportMap[tKeys[i]];
+
+          if (!tNode) {
+            continue;
+          }
+
+          tRequires = tNode.package.stats.requires;
+
+          for (j = 0, jl = tRequires.length; j < jl; j++) {
+            if (tRequires[j] in cExportMap) {
+              break;
+            }
+          }
+          
+          visitDown(tNode);
+        }
+
+        tKeys = Object.keys(cExportMap);
+        il = tKeys.length;
+      }
+
+      // Finally we just append the remaining
+      // sources that require something but
+      // it was never defined in our sources.
       
-      this.safePrint(Object.keys(cRequireMap));
-    }
+      tKeys = Object.keys(cRequireMap);
 
-    return tSorted.reverse();
-  };
+      for (i = tKeys.length - 1; i >= 0; i--) {
+        tArray = cRequireMap[tKeys[i]];
+
+        for (j = tArray.length - 1; j >= 0; j--) {
+          visitDown(tArray[j]);
+        }
+      }
+
+      return tSorted.reverse();
+    } else {
+      for (i = 0, il = pOnlyExportsList.length; i < il; i++) {
+        tExport = pOnlyExportsList[i];
+
+        if (!(tExport in cExportMap)) {
+          throwError(tExport + ' does not exist');
+        }
+
+        visitUp(cExportMap[tExport]);
+      }
+
+      return tSorted;
+    }
+  }
+
+  function throwError(pMessage) {
+    throw new Error(pMessage);
+  }
 
   var mASTProperties = [
     'elements',
@@ -353,6 +445,8 @@
 
     this.globalScope = tGlobalScope = new Scope(this, tPredefines, []);
     tGlobalScope.members = tPredefines;
+
+    tGlobalScope.assign('window', tPredefines);
 
     tGlobalScope.interpret();
 
@@ -741,8 +835,6 @@
     }
 
     if (tResolved.value === void 0 || tResolved.value === null) {
-      this.vm.log('Attempt to get ' + tName + ' of non value. Returning UNDEFINED');
-
       return this.vm.UNDEFINED();
     }
 
