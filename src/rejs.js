@@ -433,6 +433,7 @@
 
   function VM(pResolver) {
     this.nativeMode = false;
+    this.resolver = pResolver;
     this.log = pResolver.log;
     
     var tExternsJS = '';
@@ -801,6 +802,29 @@
     return pChain.vm.UNDEFINED();
   }
 
+  p.BinaryExpression = function(pAST) {
+    var tResolved = this.handleAndResolve(pAST.left);
+    var tResolved2 = this.handleAndResolve(pAST.right);
+
+    if (!tResolved.isSet && !tResolved.isRequired) {
+      tResolved.require();
+    }
+
+    if (!tResolved2.isSet && !tResolved2.isRequired) {
+      tResolved2.require();
+    }
+
+    return this.vm.UNDEFINED();
+  };
+
+  p.UnaryExpression = function(pAST) {
+    var tResolved = this.handleAndResolve(pAST.argument);
+
+    if (!tResolved.isSet && !tResolved.isRequired) {
+      tResolved.require();
+    }
+  };
+
   p.MemberExpression = function(pAST) {
     var tName;
     var tProperty;
@@ -883,9 +907,15 @@
   p.ArrayExpression = function(pAST) {
     var tArray = [];
     var i, il;
+    var tValue;
 
     for (i = 0, il = pAST.elements.length; i < il; i++) {
-      tArray[i] = this.handleAndResolve(pAST.elements[i]);
+      tValue = this.handleAndResolve(pAST.elements[i]);
+      tArray[i] = tValue;
+
+      if (!tValue.isSet && !tValue.isRequired) {
+        tValue.require();
+      }
     }
 
     return this.vm.createValue(tArray, true, true);
@@ -924,7 +954,11 @@
     if (pAST.argument === null) {
       this.returnValue = this.vm.UNDEFINED();
     } else {
-      this.returnValue = this.handleAndResolve(pAST.argument);
+      var tValue = this.returnValue = this.handleAndResolve(pAST.argument);
+
+      if (!tValue.isSet && !tValue.isRequired) {
+        tValue.require();
+      }
     }
   };
 
