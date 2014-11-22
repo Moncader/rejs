@@ -7,7 +7,7 @@
 
 (function(pAPI) {
   'use strict';
-  
+
   pAPI.Resolver = Resolver;
 
   var mAcorn;
