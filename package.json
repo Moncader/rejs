@@ -3,6 +3,9 @@
   "version": "0.0.2",
   "description": "Resolve JavaScript file order.",
   "main": "src/rejs.js",
+  "bin": {
+    "rejs": "./bin/rejs.js"
+  },
   "repository": {
     "type": "git",
     "url": "git://github.com/Moncader/rejs.git"
@@ -19,6 +22,7 @@
     "url": "https://github.com/Moncader/rejs/issues"
   },
   "dependencies": {
-    "acorn": "~0.5.0"
+    "acorn": "~0.5.0",
+    "optimist": "^0.6.1"
   }
 }
