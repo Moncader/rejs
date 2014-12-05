@@ -10,8 +10,8 @@
          |__/
 ```
 
-## Like what rejs do?
-Resolve JavaScript file order.
+## What does rejs do?
+rejs resolves JavaScript file order for you to create single JavaScript files from multiple sources without any dependency lookup errors.
 ![resolve_file_order](/img/resolve_file_order.jpg)
 
 ## Install
