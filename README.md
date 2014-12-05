@@ -12,7 +12,7 @@
 
 ## Like what rejs do?
 Resolve JavaScript file order.
-![resolve_file_order](./img/resolve_file_oreder.jpg)
+![resolve_file_order](/img/resolve_file_oreder.jpg)
 
 ## Install
 With npm do:
