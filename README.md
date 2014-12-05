@@ -1,4 +1,4 @@
-# rejs [![NPM Version](http://img.shields.io/npm/v/rejs.svg)](https://www.npmjs.org/package/rejs) [![LICENSE](http://img.shields.io/npm/l/rejs.svg)](https://github.com/watilde/rejs/blob/master/LICENSE)
+# rejs [![NPM Version](http://img.shields.io/npm/v/rejs.svg)](https://www.npmjs.org/package/rejs) [![LICENSE](http://img.shields.io/npm/l/rejs.svg)](https://github.com/Moncader/rejs/blob/master/LICENSE)
 
 > A Vanilla JS Module Builder.
 ```
