@@ -222,18 +222,85 @@
   /// VM
   /////////////////////////////
 
+  function createPrototypes(pVM) {
+    var tObjectPrototype = pVM.objectPrototype = new Value(true, false, void 0, null, true);
+    tObjectPrototype.properties = {};
+
+    var tFunctionPrototype = pVM.functionPrototype = new Value(true, false, void 0, tObjectPrototype, true);
+
+    tFunctionPrototype.setProperty('call', new Reference(new NativeFunctionValue(pVM, function(pThisReference) {
+      var tCallee = this.thisReference;
+
+      if (tCallee === null || !(tCallee.value instanceof FunctionValue)) {
+        return this.undefinedReference();
+      }
+
+      var tArguments = [];
+      var tArgumentsValueProperties = this.getReference('arguments').value.properties;
+      var i, il;
+      var tKeys;
+
+      if (tArgumentsValueProperties !== null) {
+        tKeys = Object.keys(tArgumentsValueProperties);
+
+        for (i = 1, il = tKeys.length; i < il; i++) {
+          tArguments[i - 1] = tArgumentsValueProperties[tKeys[i]];
+        }
+      }
+
+      return tCallee.value.instance(pThisReference, tArguments).execute();
+    })));
+  }
+
+  function createRejsNamespace(pVM) {
+    pVM.globalClosure.local('rejs', pVM.wrap({
+      log: function(pReference) {
+        if (!pReference) {
+          this.log(1, void 0);
+
+          return;
+        }
+
+        var tValue = pReference.value;
+
+        this.log(1, tValue.literal !== void 0 ? tValue.literal : (tValue.properties !== null ? tValue.properties : void 0));
+      },
+      dump: function(pReference, pDeep) {
+        if (!pReference) {
+          this.log(2, void 0);
+
+          return;
+        }
+
+        var tValue = pReference.value;
+
+        if (pDeep && pDeep.value.literal === true) {
+          this.log(2, tValue);
+        } else {
+          this.log(2, {
+            id: tValue.id,
+            literal: tValue.literal,
+            properties: tValue.properties ? Object.keys(tValue.properties) : null,
+            proto: tValue.proto ? tValue.proto.id : null,
+            isSet: tValue.isSet,
+            isRequired: tValue.isRequired,
+            isNative: tValue.isNative
+          });
+        }
+      }
+    }));
+  }
+
   function VM(pResolver) {
     this.resolver = pResolver;
 
-    this.callStack = [];
-    this.astStack = [];
-
-    var tObjectPrototype = this.objectPrototype = new Value(true, false, void 0, null, true);
-    tObjectPrototype.properties = {};
+    createPrototypes(this);
 
     var tGlobalObject = new Value(true, false, void 0, null, true);
 
     this.globalClosure = new Closure(this, new Reference(tGlobalObject), tGlobalObject, []);
+
+    createRejsNamespace(this);
   }
 
   tProto = VM.prototype;
@@ -262,8 +329,110 @@
     this.globalClosure.execute(pAST);
   };
 
-  tProto.log = function(pVerbosity, pMessage) {
-    this.resolver.log(pVerbosity, pMessage);
+  tProto.wrap = function(pData, pConvertFunctions) {
+    var tVM = this;
+    var tValues = [];
+    var tObjects = [];
+
+    function wrap(pData) {
+      var tType;
+      var tIndex;
+      var tValue;
+      var tKeys;
+      var i, il;
+
+      if (pData === void 0) {
+        return tVM.undefinedReference();
+      } else if (pData === null) {
+        return tVM.literalReference(pData);
+      } else if (pData instanceof Reference) {
+        return pData;
+      } else if (pData instanceof Value) {
+        return new Reference(pData);
+      } else {
+        tType = typeof pData;
+
+        if (tType === 'object') {
+          if ((tIndex = tObjects.indexOf(pData)) >= 0) {
+            return new Reference(tValues[tIndex]);
+          }
+
+          // Convert this object to our own system manually.
+          
+          tValue = new Value(true, false, void 0, pData.__proto__ === null ? null : wrap(pData.__proto__), true);
+          tObjects.push(pData);
+          tValues.push(tValue);
+
+          tKeys = Object.keys(pData);
+
+          for (i = 0, il = tKeys.length; i < il; i++) {
+            tValue.setProperty(tKeys[i], wrap(pData[tKeys[i]]));
+          }
+
+          return new Reference(tValue);
+        } else if (tType === 'function') {
+          if ((tIndex = tObjects.indexOf(pData)) >= 0) {
+            return new Reference(tValues[tIndex]);
+          }
+
+          if (pConvertFunctions) {
+            // TODO: Attempt to get the source code via toString
+            // then ASTize it, and make a new FunctionValue.
+            return tVM.undefinedReference();
+          }
+
+          tValue = new NativeFunctionValue(tVM, pData);
+          tObjects.push(pData);
+          tValues.push(tValue);
+
+          return new Reference(tValue);
+        } else {
+          return tVM.literalReference(pData);
+        }
+      }
+    }
+
+    return wrap(pData);
+  };
+
+  tProto.log = function(pVerbosity, pObject) {
+    var mCache = [];
+
+    this.resolver.log(pVerbosity, JSON.stringify(pObject, function(pKey, pValue) {
+      if (pValue === void 0) {
+        return '(undefined)';
+      } else if (typeof pValue === 'object' && pValue !== null) {
+        if (mCache.indexOf(pValue) !== -1) {
+          return '... (circular reference to object)';
+        }
+
+        if (pValue instanceof VM || pValue instanceof Closure) {
+          return;
+        }
+
+        mCache.push(pValue);
+      } else if (typeof pValue === 'function') {
+        if (mCache.indexOf(pValue) !== -1) {
+          return '... (circular reference to function)';
+        }
+
+        if (pValue instanceof VM || pValue instanceof Closure) {
+          return;
+        }
+
+        mCache.push(pValue);
+
+        var tObject = {};
+
+        for (var k in pValue) {
+          tObject[k] = pValue[k];
+        }
+
+        return tObject;
+      }
+
+      return pValue;
+    }, 2));
   };
 
   /////////////////////////////
@@ -374,7 +543,7 @@
   /////////////////////////////
 
   function FunctionValue(pVM, pParentClosures, pName, pArguments, pAST) {
-    Value.call(this, true, false, void 0, pVM.objectPrototype, false);
+    Value.call(this, true, false, void 0, pVM.functionPrototype, false);
 
     this.vm = pVM;
     this.parentClosures = pParentClosures;
@@ -388,25 +557,51 @@
   tProto = FunctionValue.prototype = Object.create(Value.prototype);
   tProto.constructor = FunctionValue;
 
-  tProto.instance = function() {
-    var tInstance = new Closure(this.vm, void 0, this.vm.value(), this.parentClosures);
+  tProto.instance = function(pThisReference, pArguments) {
+    var tInstance = new Closure(this.vm, pThisReference, this.vm.value(), this.parentClosures);
+    var tArgumentsReference = tInstance.valueReference();
+    var tArgumentsValue = tArgumentsReference.value;
     var tArgumentNames;
     var i, il;
+
+    tInstance.ast = this.ast;
 
     if (this.name) {
       tInstance.local(this.name, new Reference(this));
     }
 
+    for (i = 0, il = pArguments.length; i < il; i++) {
+      tArgumentsValue.setProperty(i + '', pArguments[i]);
+    }
+
+    tInstance.local('arguments', tArgumentsReference);
+
     tArgumentNames = this.args;
 
     if (tArgumentNames) {
       for (i = 0, il = tArgumentNames.length; i < il; i++) {
-        tInstance.local(tArgumentNames[i], this.vm.undefinedReference());
+        tInstance.local(tArgumentNames[i], pArguments[i] || this.vm.undefinedReference());
       }
     }
 
     return tInstance;
   };
+
+  /////////////////////////////
+  /// NativeFunction Value
+  /////////////////////////////
+
+  function NativeFunctionValue(pVM, pCallback) {
+    FunctionValue.call(this, pVM, [], void 0, [], [
+      {
+        type: 'rejsNativeCallback',
+        callback: pCallback
+      }
+    ]);
+  }
+
+  tProto = NativeFunctionValue.prototype = Object.create(FunctionValue.prototype);
+  tProto.constructor = NativeFunctionValue;
 
   /////////////////////////////
   /// References
@@ -430,6 +625,7 @@
     this.returnReference = this.undefinedReference();
     this.locals = pLocals;
     this.parentClosures = pParentClosures;
+    this.ast = null;
   }
 
   tProto = Closure.prototype;
@@ -485,6 +681,10 @@
     }
 
     return null;
+  };
+
+  tProto.wrap = function(pData) {
+    return this.vm.wrap(pData);
   };
 
   tProto.log = function(pVerbosity, pMessage) {
@@ -550,7 +750,6 @@
     var tAST;
     var i, il;
     var tVM = pClosure.vm;
-    var tASTStack = tVM.astStack;
     var tType;
     var tResult = void 0;
 
@@ -562,8 +761,6 @@
 
     for (i = 0, il = tASTList.length; i < il; i++) {
       tAST = tASTList[i];
-      tASTStack.push(tAST);
-
       tType = tAST.type;
 
       if (tType === 'FunctionDeclaration' || tType === 'VariableDeclarator') {
@@ -587,14 +784,14 @@
         // Panic for now.
         //throw new Error('Unsupported AST Type: ' + tType);
       }
-
-      tASTStack.pop();
     }
 
     return tResult;
   }
 
   tProto.execute = function(pAST) {
+    pAST = pAST || this.ast || [];
+
     preprocessAST(this, pAST);
 
     return interpret(this, pAST);
@@ -605,6 +802,22 @@
   /// AST Handlers
   /////////////////////////////
 
+  tProto.rejsNativeCallback = function(pAST) {
+    var tArguments = [];
+    var tArgumentsValueProperties = this.getReference('arguments').value.properties;
+    var i, il;
+    var tKeys;
+
+    if (tArgumentsValueProperties !== null) {
+      tKeys = Object.keys(tArgumentsValueProperties);
+
+      for (i = 0, il = tKeys.length; i < il; i++) {
+        tArguments[i] = tArgumentsValueProperties[tKeys[i]];
+      }
+    }
+
+    return (this.returnReference = this.wrap(pAST.callback.apply(this, tArguments)));
+  };
 
   tProto.Program = tProto.BlockStatement = function(pAST) {
     return interpret(this, pAST.body);
@@ -620,48 +833,46 @@
 
   tProto.NewExpression = tProto.CallExpression = function(pAST) {
     var tArgumentsAST = pAST.arguments;
-    var tArgumentsReference = this.valueReference();
-    var tArgumentsValue = tArgumentsReference.value;
-    var tArgumentNames;
-    var tCallee;
+    var tArguments = [];
+    var tCalleeValue;
     var tCalleeInstance;
     var tThisReference;
     var i, il;
 
     for (i = 0, il = tArgumentsAST.length; i < il; i++) {
-      tArgumentsValue.setProperty(i + '', interpret(this, tArgumentsAST[i]));
+      tArguments[i] = interpret(this, tArgumentsAST[i]);
     }
 
-    tCallee = interpret(this, pAST.callee);
+    tCalleeValue = interpret(this, pAST.callee).value;
 
-    if (!(tCallee.value instanceof FunctionValue)) {
+
+
+    if (!(tCalleeValue instanceof FunctionValue)) {
+      if (tCalleeValue.isSet === false) {
+        //tCalleeValue
+      }
+
+      // TODO: Do we need to track this to to resolve
+      // order later?
       return this.requiredReference();
     }
 
-    tCalleeInstance = tCallee.value.instance();
-    tCalleeInstance.local('arguments', tArgumentsReference);
-
-    tArgumentNames = tCallee.value.args;
-
-    for (i = 0, il = tArgumentNames.length; i < il; i++) {
-      tCalleeInstance.local(tArgumentNames[i], tArgumentsValue.getProperty(i + '') || this.undefinedReference());
-    }
-
     if (pAST.type === 'NewExpression') {
-      tThisReference = tCalleeInstance.thisReference = this.valueReference(tCallee.value.getProperty('prototype').value);
+      tThisReference = this.valueReference(tCalleeValue.getProperty('prototype').value);
       tThisReference.value.properties = {};
 
-      tCalleeInstance.execute(tCallee.value.ast);
+      tCalleeInstance = tCalleeValue.instance(tThisReference, tArguments);
+      tCalleeInstance.execute();
 
       return tThisReference;
     }
 
-
     if (this.futureThisReference !== null) {
-      tCalleeInstance.thisReference = this.futureThisReference;
+      tThisReference = this.futureThisReference;
     }
 
-    tCalleeInstance.execute(tCallee.value.ast);
+    tCalleeInstance = tCalleeValue.instance(tThisReference, tArguments);
+    tCalleeInstance.execute();
 
     return tCalleeInstance.returnReference;
   };
@@ -701,8 +912,8 @@
   };
 
   tProto.AssignmentExpression = function(pAST) {
-    var tLeftReference = interpret(this, pAST.left);
     var tRightReference = interpret(this, pAST.right);
+    var tLeftReference = interpret(this, pAST.left);
     var tOperator = pAST.operator;
 
     switch (tOperator) {
@@ -852,7 +1063,7 @@
     var tOperator = pAST.operator;
 
     if (!pAST.prefix) {
-      safePrint(this.vm.resolver, 0, pAST);
+      this.log(0, pAST);
     }
 
     switch (tOperator) {
@@ -1079,13 +1290,11 @@
       if (tRootValue === false) {
         if (pReference.isSet === true && tValue.isNative === false) {
           tExports.push(tNamespaceStack.join('.'));
-        }
 
-        if (tValue.id in tCache) {
-          return;
-        }
-
-        if (tValue.isRequired === true && tValue.isNative === false/* && tNamespaceStack[tNamespaceStack.length - 1] !== 'prototype'*/) {
+          if (tValue.id in tCache) {
+            return;
+          }
+        } else if (tValue.isRequired === true && tValue.isNative === false && !(tValue.id in tCache)) {
           tRequires.push(tNamespaceStack.join('.'));
         }
       } else {
@@ -1327,38 +1536,6 @@
 
   function throwError(pMessage) {
     throw new Error(pMessage);
-  }
-
-  var mCache = [];
-
-  function safePrint(pResolver, pVerbosity, pObject) {
-    pResolver.log(pVerbosity, JSON.stringify(pObject, function(pKey, pValue) {
-      if (typeof pValue === 'object' && pValue !== null) {
-        if (mCache.indexOf(pValue) !== -1) {
-          return '... (circular reference to object)';
-        }
-
-        mCache.push(pValue);
-      } else if (typeof pValue === 'function') {
-        if (mCache.indexOf(pValue) !== -1) {
-          return '... (circular reference to function)';
-        }
-
-        mCache.push(pValue);
-
-        var tObject = {};
-
-        for (var k in pValue) {
-          tObject[k] = pValue[k];
-        }
-
-        return tObject;
-      }
-
-      return pValue;
-    }, 2));
-
-    mCache.length = 0;
   }
 
 }(typeof exports === 'object' ? exports : (this.rejs = {})));
