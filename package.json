@@ -6,6 +6,9 @@
   "bin": {
     "rejs": "./bin/rejs.js"
   },
+  "scripts": {
+    "test": "eslint --reset --config ./.eslintrc --rulesdir test/rules/ src/rejs.js"
+  },
   "repository": {
     "type": "git",
     "url": "git://github.com/Moncader/rejs.git"
@@ -24,5 +27,8 @@
   "dependencies": {
     "acorn": "~0.5.0",
     "optimist": "^0.6.1"
+  },
+  "devDependencies": {
+    "eslint": "^0.14.1"
   }
 }

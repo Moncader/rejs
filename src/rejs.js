@@ -357,7 +357,7 @@
               break;
             }
           }
-          
+
           visitDown(tNode);
         }
 
@@ -368,7 +368,7 @@
       // Finally we just append the remaining
       // sources that require something but
       // it was never defined in our sources.
-      
+
       tKeys = Object.keys(cRequireMap);
 
       for (i = tKeys.length - 1; i >= 0; i--) {
@@ -435,7 +435,7 @@
     this.nativeMode = false;
     this.resolver = pResolver;
     this.log = pResolver.log;
-    
+
     var tExternsJS = '';
     var tGlobalScope;
     var tPredefines;
@@ -532,7 +532,7 @@
 
     for (i = tScopes.length - 1; i >= 0; i--) {
       tScope = tScopes[i];
-      
+
       if (tScope.members.value.hasOwnProperty(tName)) {
         return tScope.members.value[tName];
       }
@@ -650,7 +650,7 @@
 
   p.handleAndResolve = function(pAST) {
     var tResult = this.handle(pAST);
-    
+
     return this.resolve(tResult);
   };
 
