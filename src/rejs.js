@@ -9,6 +9,13 @@
   'use strict';
 
   pAPI.Resolver = Resolver;
+  pAPI.ResolverKeyError = ResolverKeyError;
+  pAPI.VM = VM;
+  pAPI.Value = Value;
+  pAPI.FunctionValue = FunctionValue;
+  pAPI.NativeFunctionValue = NativeFunctionValue;
+  pAPI.Reference = Reference;
+  pAPI.Closure = Closure;
 
   var mAcorn;
 
@@ -16,6 +23,14 @@
     mAcorn = acorn;
   } else {
     mAcorn = require('acorn');
+  }
+
+  var mAlphabetical;
+
+  if (typeof alphabetical !== 'undefined') {
+    mAlphabetical = alphabetical;
+  } else {
+    mAlphabetical = require('alphabetical');
   }
 
   function defaultReadCache() {
@@ -81,6 +96,11 @@
     this.verbosity = pOptions.verbosity || 0;
 
     this._stats = [];
+    this._sources = [];
+    this._unsortedSources = [];
+    this._sortedSources = [];
+
+    this.vm = new VM(this);
   }
 
   function ResolverKeyError(pKey, pMessage, pOriginalError) {
@@ -135,10 +155,14 @@
   function addKey(pResolver, pKey) {
     var tReadFunction;
     var tSource;
+    var tUnsortedSources = pResolver._unsortedSources;
+    var tSortedSources = pResolver._sortedSources;
+    var tSourceCode;
     var tStatsIndex = findKeyStatsIndex(pResolver, pKey);
     var tStats;
     var tAST;
-    var tVM;
+    var tVM = pResolver.vm;
+    var i, il;
 
     if (tStatsIndex !== -1) {
       pResolver._stats.splice(tStatsIndex, 1);
@@ -157,29 +181,46 @@
     }
 
     tReadFunction = pResolver.readSource;
-    tSource = tReadFunction(pKey);
+    tSourceCode = tReadFunction(pKey);
 
-    if (tSource === null || tSource === void 0) {
+    if (tSourceCode === null || tSourceCode === void 0) {
       return 'Non existing source';
-    } else if (typeof tSource === 'string') {
-      tAST = mAcorn.parse(tSource, pResolver.acornOptions);
-    } else if (typeof tSource === 'object') {
+    } else if (typeof tSourceCode === 'string') {
+      tAST = mAcorn.parse(tSourceCode, pResolver.acornOptions);
+    } else if (typeof tSourceCode === 'object') {
       // This better be some AST
-      tAST = tSource;
+      tAST = tSourceCode;
     } else {
       return 'Invalid source';
     }
 
-    tVM = new VM(pResolver);
-    tVM.execute(tAST);
-    tStats = exportStats(tVM.globalClosure);
+    tSource = new Source(pKey, tAST);
+    tSource.AIL = toAILFromAST(tAST);
+    pResolver._sources.push(tSource);
+
+    
+    if (tVM.execute(tSource, 0) === true) {
+      tSortedSources.push(tSource);
+    } else {
+      tUnsortedSources.push(tSource);
+    }
+
+    for (i = 0, il = tUnsortedSources.length - 1; i < il; i++) {
+      if (tVM.execute(tUnsortedSources[i], 0) === true) {
+        tSortedSources.push(tUnsortedSources[i]);
+        tUnsortedSources.splice(i--, 1);
+        il--;
+      }
+    }
+
+    /*tStats = exportStats(tVM.globalClosure);
 
     pResolver._stats.push({
       key: pKey,
       data: tStats
     });
 
-    pResolver.writeCache(pKey, tStats);
+    pResolver.writeCache(pKey, tStats);*/
 
     return '';
   };
@@ -210,7 +251,32 @@
   };
 
   tProto.resolve = function(pExports) {
-    return sortStats(this, pExports || null);
+    var tUnsortedSources = this._unsortedSources;
+    var tSortedSources = this._sortedSources;
+    var i;
+    var il = tUnsortedSources.length;
+    var tResult;
+    var tVM = this.vm;
+
+    while (il !== 0) {
+      for (i = 0; i < il; i++) {
+        if (tVM.execute(tUnsortedSources[i], 1) === true) {
+          tSortedSources.push(tUnsortedSources[i]);
+          tUnsortedSources.splice(i--, 1);
+          il--;
+        }
+      }
+    }
+
+    il = tSortedSources.length;
+    tResult = new Array(il);
+
+    for (i = 0; i < il; i++) {
+      tResult[i] = tSortedSources[i].key;
+    }
+
+    return tResult;
+    //return sortStats(this, pExports || null);
   };
 
 
@@ -219,16 +285,849 @@
   /////////////////////////////////////////////////////////
   
   /////////////////////////////
+  /// IL
+  /////////////////////////////
+  
+  var IL_NOOP = 0,
+      IL_DECLARE = 1,
+      IL_LITERAL = 2,
+      IL_DEFINE = 3,
+      IL_PUSH = 4,
+      IL_POP = 5,
+      IL_AST = 6,
+      IL_IL = 7,
+      IL_CALL = 8,
+      IL_NEW = 9,
+      IL_FUNCTION = 10,
+      IL_UNDEFINED = 11,
+      IL_OBJECT = 12,
+      IL_ARRAY = 13,
+      IL_PUSH_MULTI = 14,
+      IL_POP_MULTI = 15;
+
+  function IL() {
+    this.code = [];
+    this.stackIndex = 0;
+    this.stackIndices = [];
+  }
+
+  var tProto = IL.prototype;
+
+  tProto.saveStackIndex = function() {
+    this.stackIndices.push(this.stackIndex);
+  };
+
+  tProto.restoreStackIndex = function() {
+    var tDiff = this.stackIndex - this.stackIndices.pop();
+
+    if (tDiff === 1) {
+      this.POP();
+    } else if (tDiff > 1) {
+      this.POP_MULTI(tDiff);
+    }
+  };
+
+  tProto.NOOP = function() {
+    this.code.push(IL_NOOP);
+
+    return this;
+  };
+
+  tProto.DECLARE = function(pName) {
+    this.code.push(IL_DECLARE, pName);
+
+    return this;
+  };
+
+  tProto.LITERAL = function(pValue) {
+    this.code.push(IL_LITERAL, pValue);
+    this.stackIndex++;
+
+    return this;
+  };
+
+  tProto.DEFINE = function(pName) {
+    this.code.push(IL_DEFINE, pName);
+    this.stackIndex--;
+
+    return this;
+  };
+
+  tProto.PUSH = function(pValue) {
+    this.code.push(IL_PUSH, pValue);
+    this.stackIndex++;
+
+    return this;
+  };
+
+  tProto.POP = function() {
+    this.code.push(IL_POP);
+    this.stackIndex--;
+
+    return this;
+  };
+
+  tProto.AST = function(pValue) {
+    this.code.push(IL_AST, pValue);
+    this.stackIndex++;
+
+    return this;
+  };
+
+  tProto.IL = function(pValue) {
+    this.code.push(IL_IL, pValue);
+    this.stackIndex++;
+
+    return this;
+  };
+
+  tProto.CALL = function() {
+    this.code.push(IL_CALL);
+    this.stackIndex++;
+
+    return this;
+  };
+
+  tProto.NEW = function() {
+    this.code.push(IL_NEW);
+    this.stackIndex++;
+
+    return this;
+  };
+
+  tProto.FUNCTION = function(pName, pArguments, pBody) {
+    var tCode = this.code;
+    var i;
+    var il = pArguments.length;
+
+    for (i = 0; i < il; i++) {
+      tCode.push(pArguments[i]);
+    }
+
+    tCode.push(IL_PUSH_MULTI, il);
+    tCode.push(IL_PUSH, pName);
+    tCode.push(IL_AST, pBody);
+    tCode.push(IL_FUNCTION);
+
+    this.stackIndex -= il + 2;
+
+    return this;
+  };
+
+  tProto.UNDEFINED = function() {
+    this.code.push(IL_UNDEFINED);
+    this.stackIndex++;
+
+    return this;
+  };
+
+  tProto.OBJECT = function() {
+    this.code.push(IL_OBJECT);
+    this.stackIndex++;
+
+    return this;
+  };
+
+  tProto.ARRAY = function(pSize) {
+    this.code.push(IL_ARRAY, pSize);
+    this.stackIndex++;
+
+    return this;
+  };
+
+  tProto.PUSH_MULTI = function(pNumber) {
+    this.code.push(IL_PUSH_MULTI, pNumber);
+
+    for (var i = 1; i < pNumber; i++) {
+      this.code.push(arguments[i]);
+    }
+
+    this.stackIndex += pNumber;
+
+    return this;
+  };
+
+  tProto.POP_MULTI = function(pNumber) {
+    this.code.push(IL_POP_MULTI, pNumber);
+    this.stackIndex -= pNumber;
+
+    return this;
+  };
+
+  tProto.RETURN_VOID = function() {
+    this.code.push(IL_RETURN_VOID);
+    this.stackIndex++;
+
+    return this;
+  };
+
+  tProto.RETURN = function() {
+    this.code.push(IL_RETURN);
+
+    return this;
+  };
+
+  tProto.INCR = function() {
+    this.code.push(IL_INCR);
+
+    return this;
+  };
+
+  tProto.DECR = function() {
+    this.code.push(IL_DECR);
+
+    return this;
+  };
+
+  tProto.TYPEOF = function() {
+    this.code.push(IL_TYPEOF);
+
+    return this;
+  };
+
+  tProto.CONVERT_NUMBER = function() {
+    this.code.push(IL_CONVERT_NUMBER);
+
+    return this;
+  };
+
+  tProto.NEGATIVE = function() {
+    this.code.push(IL_NEGATIVE);
+
+    return this;
+  };
+
+  tProto.BITNOT = function() {
+    this.code.push(IL_BITNOT);
+
+    return this;
+  };
+
+  tProto.NOT = function() {
+    this.code.push(IL_NOT);
+
+    return this;
+  };
+
+  tProto.REPLACE = function() {
+    this.code.push(IL_REPLACE);
+
+    return this;
+  };
+
+  tProto.BITAND = function() {
+    this.code.push(IL_BITAND);
+    this.stackIndex--;
+
+    return this;
+  };
+
+  tProto.BITXOR = function() {
+    this.code.push(IL_BITXOR);
+    this.stackIndex--;
+
+    return this;
+  };
+
+  tProto.BITOR = function() {
+    this.code.push(IL_BITOR);
+    this.stackIndex--;
+
+    return this;
+  };
+
+  tProto.ADD = function() {
+    this.code.push(IL_ADD);
+    this.stackIndex--;
+
+    return this;
+  };
+
+  tProto.SUB = function() {
+    this.code.push(IL_SUB);
+    this.stackIndex--;
+
+    return this;
+  };
+
+  tProto.MUL = function() {
+    this.code.push(IL_MUL);
+    this.stackIndex--;
+
+    return this;
+  };
+
+  tProto.DIV = function() {
+    this.code.push(IL_DIV);
+    this.stackIndex--;
+
+    return this;
+  };
+
+  tProto.MOD = function() {
+    this.code.push(IL_MOD);
+    this.stackIndex--;
+
+    return this;
+  };
+
+  tProto.SHIFTL = function() {
+    this.code.push(IL_SHIFTL);
+    this.stackIndex--;
+
+    return this;
+  };
+
+  tProto.SHIFTR = function() {
+    this.code.push(IL_SHIFTR);
+    this.stackIndex--;
+
+    return this;
+  };
+
+  tProto.SHIFTRU = function() {
+    this.code.push(IL_SHIFTRU);
+    this.stackIndex--;
+
+    return this;
+  };
+
+  tProto.ASSIGN = function() {
+    this.code.push(IL_ASSIGN);
+    this.stackIndex--;
+
+    return this;
+  };
+
+  tProto.ASSIGN_MUL = function() {
+    this.code.push(IL_ASSIGN_MUL);
+    this.stackIndex--;
+
+    return this;
+  };
+
+  tProto.ASSIGN_DIV = function() {
+    this.code.push(IL_ASSIGN_DIV);
+    this.stackIndex--;
+
+    return this;
+  };
+
+  tProto.ASSIGN_MOD = function() {
+    this.code.push(IL_ASSIGN_MOD);
+    this.stackIndex--;
+
+    return this;
+  };
+
+  tProto.ASSIGN_ADD = function() {
+    this.code.push(IL_ASSIGN_ADD);
+    this.stackIndex--;
+
+    return this;
+  };
+
+  tProto.ASSIGN_SUB = function() {
+    this.code.push(IL_ASSIGN_SUB);
+    this.stackIndex--;
+
+    return this;
+  };
+
+  tProto.ASSIGN_SHIFTL = function() {
+    this.code.push(IL_ASSIGN_SHIFTL);
+    this.stackIndex--;
+
+    return this;
+  };
+
+  tProto.ASSIGN_SHIFTR = function() {
+    this.code.push(IL_ASSIGN_SHIFTR);
+    this.stackIndex--;
+
+    return this;
+  };
+
+  tProto.ASSIGN_SHIFTRU = function() {
+    this.code.push(IL_ASSIGN_SHIFTRU);
+    this.stackIndex--;
+
+    return this;
+  };
+
+  tProto.ASSIGN_BITAND = function() {
+    this.code.push(IL_ASSIGN_BITAND);
+    this.stackIndex--;
+
+    return this;
+  };
+
+  tProto.ASSIGN_BITXOR = function() {
+    this.code.push(IL_ASSIGN_BITXOR);
+    this.stackIndex--;
+
+    return this;
+  };
+
+  tProto.ASSIGN_BITOR = function() {
+    this.code.push(IL_ASSIGN_BITOR);
+    this.stackIndex--;
+
+    return this;
+  };
+
+  var mASTILMap = {};
+
+  mASTILMap.Program = mASTILMap.BlockStatement = function(pAST, pIL) {
+    var tBody = pAST.body;
+
+    for (var i = 0, il = tBody.length; i < il; i++) {
+      convertAST(tBody[i], pIL);
+    }
+  };
+
+  mASTILMap.ExpressionStatement = function(pAST, pIL) {
+    convertAST(pAST.expression, pIL);
+  };
+
+  mASTILMap.EmptyExpression = function(pAST, pIL) {
+    
+  };
+
+  mASTILMap.NewExpression = mASTILMap.CallExpression = function(pAST, pIL) {
+    var tArgumentsAST = pAST.arguments;
+    var i;
+    var il = tArgumentsAST.length;
+
+    for (i = 0; i < il; i++) {
+      convertAST(tArgumentsAST[i], pIL);
+    }
+
+    pIL.add(IL_PUSH, il);
+
+    convertAST(pAST.callee, pIL);
+
+    pIL.add(pAST.type === 'NewExpression' ? IL_NEW : IL_CALL);
+  };
+
+  mASTILMap.FunctionExpression = function(pAST, pIL) {
+    var tKeys = pAST.params;
+    var i;
+    var il = tKeys.length;
+    var tArguments = new Array(il);
+
+    for (i = 0; i < il; i++) {
+      tArguments[i] = tKeys[i].name;
+    }
+
+    pIL.FUNCTION(
+      pAST.id ? pAST.id.name : null,
+      tArguments,
+      pAST.body
+    );
+  };
+
+  mASTILMap.VariableDeclaration = function(pAST, pIL) {
+    var tDeclarations = pAST.declarations;
+    var tDeclaration;
+    var i, il;
+
+    for (i = 0, il = tDeclarations.length; i < il; i++) {
+      tDeclaration = tDeclarations[i];
+
+      if (tDeclaration.init) {
+        convertAST(tDeclaration.init, pIL);
+        pIL.add(IL_DEFINE, tDeclaration.id.name);
+      } else {
+        pIL.add(IL_DECLARE, tDeclaration.id.name);
+      }
+    }
+  };
+
+  mASTILMap.AssignmentExpression = function(pAST, pIL) {
+    var tOperator = pAST.operator;
+
+    convertAST(pAST.right, pIL);
+    convertAST(pAST.left, pIL);
+
+    switch (tOperator) {
+      case '=':
+        pIL.add(IL_ASSIGN);
+
+        break;
+      case '*=':
+        pIL.add(IL_ASSIGN_MUL);
+
+        break;
+      case '/=':
+        pIL.add(IL_ASSIGN_DIV);
+
+        break;
+      case '%=':
+        pIL.add(IL_ASSIGN_MOD);
+
+        break;
+      case '+=':
+        pIL.add(IL_ASSIGN_ADD);
+
+        break;
+      case '-=':
+        pIL.add(IL_ASSIGN_SUB);
+
+        break;
+      case '<<=':
+        pIL.add(IL_ASSIGN_SHIFTL);
+
+        break;
+      case '>>=':
+        pIL.add(IL_ASSIGN_SHIFTR);
+
+        break;
+      case '>>>=':
+        pIL.add(IL_ASSIGN_SHIFTRU);
+
+        break;
+      case '&=':
+        pIL.add(IL_ASSIGN_BITAND);
+
+        break;
+      case '^=':
+        pIL.add(IL_ASSIGN_BITXOR);
+
+        break;
+      case '|=':
+        pIL.add(IL_ASSIGN_BITOR);
+
+        break;
+      default:
+        //this.log(2, 'Unsupported AssignmentExpression Operator: ' + tOperator);
+
+        break;
+    }
+  };
+
+  mASTILMap.BinaryExpression = function(pAST, pIL) {
+    convertAST(pAST.left, pIL);
+    convertAST(pAST.right, pIL);
+
+    var tOperator = pAST.operator;
+
+    switch (tOperator) {
+      case '+':
+        pIL.ADD();
+
+        break;
+      case '-':
+        pIL.SUB();
+
+        break;
+      case '*':
+        pIL.MUL();
+
+        break;
+      case '/':
+        pIL.DIV();
+
+        break;
+      case '%':
+        pIL.MOD();
+
+        break;
+      case '<<':
+        pIL.SHIFTL();
+
+        break;
+      case '>>':
+        pIL.SHIFTR();
+
+        break;
+      case '>>>':
+        pIL.SHIFTRU();
+
+        break;
+      case '<':
+      case '>':
+      case '<=':
+      case '>=':
+      case '==':
+      case '===':
+      case '!=':
+      case '!==':
+      case '&&':
+      case '||':
+      case 'instanceof':
+      case 'in':
+        // The result of all of this is a boolean that
+        // in only very very rare cases would affect
+        // the names of variables set.
+        // Remember that we interpret all conditions in code
+        // so it doesn't matter if a test passes or not.
+        // Therefore for performance we'll just return false
+        // for all of them.
+        pIL.POP().REPLACE(false);
+
+        break;
+      case '&':
+        pIL.BITAND();
+
+        break;
+      case '^':
+        pIL.BITXOR();
+
+        break;
+      case '|':
+        pIL.BITOR();
+
+        break;
+      default:
+        //this.log(2, 'Unsupported BinaryExpression Operator: ' + tOperator);
+
+        break;
+    }
+  };
+
+  mASTILMap.UnaryExpression = function(pAST, pIL) {
+    var tOperator = pAST.operator;
+
+    convertAST(pAST.argument, pIL);
+
+    switch (tOperator) {
+      case 'delete':
+        // Don't actually delete anything.
+        pIL.PUSH(true);
+
+        break;
+      case 'void':
+        pIL.UNDEFINED();
+
+        break;
+      case 'typeof':
+        pIL.TYPEOF();
+        
+        break;
+      case '+':
+        pIL.CONVERT_NUMBER();
+
+        break;
+      case '-':
+        pIL.NEGATIVE();
+
+        break;
+      case '~':
+        pIL.BITNOT();
+
+        break;
+      case '!':
+        pIL.NOT();
+
+        break;
+      default:
+        //this.log(2, 'Unsupported UnaryExpression Operator: ' + tOperator);
+
+        break;
+    }
+  };
+
+  mASTILMap.UpdateExpression = function(pAST, pIL) {
+    var tOperator = pAST.operator;
+
+    convertAST(pAST.argument);
+
+    if (tOperator === '++') {
+      pIL.INCR();
+    } else if (tOperator === '--') {
+      pIL.DECR();
+    } else {
+      //this.log(2, 'Unsupported UpdateExpression Operator: ' + tOperator);
+    }
+  };
+
+  mASTILMap.MemberExpression = function(pAST, pIL) {
+
+  };
+
+  mASTILMap.Identifier = function(pAST, pIL) {
+    
+  };
+
+  mASTILMap.ThisExpression = function(pAST, pIL) {
+    
+  };
+
+  mASTILMap.Literal = function(pAST, pIL) {
+    
+  };
+
+  mASTILMap.ObjectExpression = function(pAST, pIL) {
+    
+  };
+
+  mASTILMap.ArrayExpression = function(pAST, pIL) {
+    
+  };
+
+  mASTILMap.IfStatement = function(pAST, pIL) {
+    
+  };
+
+  mASTILMap.ForInStatement = function(pAST, pIL) {
+    
+  };
+
+  mASTILMap.ForStatement = function(pAST, pIL) {
+    var i, il;
+
+    if (pAST.init) {
+      pIL.saveStackIndex();
+      convertAST(pAST.init, pIL);
+      pIL.restoreStackIndex();
+    }
+
+    if (pAST.test) {
+      pIL.saveStackIndex();
+      convertAST(pAST.test, pIL);
+      pIL.restoreStackIndex();
+    }
+
+    if (pAST.update) {
+      pIL.saveStackIndex();
+      convertAST(pAST.update, pIL);
+      pIL.restoreStackIndex();
+    }
+
+    // TODO: Provide option actually run this loop.
+    
+    if (pAST.body instanceof Array) {
+      for (i = 0, il = pAST.body.length; i < il; i++) {
+        convertAST(pAST.body[i], pIL);
+      }
+    } else {
+      convertAST(pAST.body, pIL);
+    }
+  };
+
+  mASTILMap.ReturnStatement = function(pAST, pIL) {
+    if (pAST.argument === null) {
+      pIL.RETURN_VOID();
+    } else {
+      pIL.RETURN();
+    }
+  };
+
+  function hoistAST(pAST, pAIL) {
+    var i, il, j, jl;
+    var tAST;
+    var tType;
+    var tKeys;
+    var tValue;
+
+    for (i = 0, il = pAST.length; i < il; i++) {
+      tAST = pAST[i];
+      tType = tAST.type;
+
+      if (tType === 'VariableDeclarator') {
+        pAIL.add(IL_DECLARE, tAST.id.name);
+      } else if (tType === 'FunctionDeclaration') {
+        tKeys = tAST.params;
+        jl = tKeys.length;
+
+        pAIL.add(IL_PUSH_MULTI, jl);
+
+        for (j = 0; j < jl; j++) {
+          pAIL.add(tKeys[j].name);
+        }
+
+        pAIL
+        .add(IL_AST, pAST.body)
+        .add(IL_PUSH, pAST.id ? pAST.id.name : null)
+        .add(IL_FUNCTION);
+
+        pAIL.add(IL_DEFINE, tAST.id.name);
+      } else if (tType === 'FunctionExpression') {
+        // Ignore things that make their own Closure.
+      } else {
+        // Attempt to process everything else.
+        tKeys = Object.keys(tAST);
+
+        for (j = 0, jl = tKeys.length; j < jl; j++) {
+          tValue = tAST[tKeys[j]];
+
+          if (typeof tValue === 'object' && tValue !== null) {
+            hoistAST(tValue, pAIL);
+          }
+        }
+      }
+    }
+  }
+
+  function convertAST(pAST, pAIL) {
+    var i, il, j, jl;
+    var tAST;
+    var tType;
+    var tASTProperties = mASTProperties;
+    var tASTPropertiesLength = tASTProperties.length;
+
+    for (i = 0, il = pAST.length; i < il; i++) {
+      tAST = pAST[i];
+      tType = tAST.type;
+
+      if (tType === 'FunctionDeclaration' || tType === 'VariableDeclarator') {
+        continue;
+      }
+
+      if (tType in mASTILMap) {
+        mASTILMap[tType](tAST, pAIL);
+      } else {
+        for (j = 0; j < tASTPropertiesLength; j++) {
+          if (tAST[tASTProperties[j]]) {
+            convertAST(tAST[tASTProperties[j]], pAIL);
+          }
+        }
+        // Panic for now.
+        //throw new Error('Unsupported AST Type: ' + tType);
+      }
+    }
+  }
+
+  function toAILFromAST(pAST) {
+    var tAIL = new mAlphabetical.AIL();
+    var tASTList;
+    var tAST;
+    var i, il;
+
+    if (pAST.__proto__ !== Array.prototype) {
+      tASTList = [pAST];
+    } else {
+      tASTList = pAST;
+    }
+
+    hoistAST(tASTList, tAIL);
+    convertAST(tASTList, tAIL);
+
+    return tAIL;
+  }
+
+  /////////////////////////////
+  /// Source
+  /////////////////////////////
+
+  function Source(pKey, pAST) {
+    this.key = pKey;
+    this.ast = pAST;
+    this.ail = null;
+  }
+
+  /////////////////////////////
   /// VM
   /////////////////////////////
 
   function createPrototypes(pVM) {
-    var tObjectPrototype = pVM.objectPrototype = new Value(true, false, void 0, null, true);
+    var tObjectPrototype = pVM.objectPrototype = pVM.value(null);
     tObjectPrototype.properties = {};
 
-    var tFunctionPrototype = pVM.functionPrototype = new Value(true, false, void 0, tObjectPrototype, true);
+    var tFunctionPrototype = pVM.functionPrototype = pVM.value(tObjectPrototype);
 
-    tFunctionPrototype.setProperty('call', new Reference(new NativeFunctionValue(pVM, function(pThisReference) {
+    tFunctionPrototype.setProperty('call', pVM.reference(new NativeFunctionValue(pVM, function(pThisReference) {
       var tCallee = this.thisReference;
 
       if (tCallee === null || !(tCallee.value instanceof FunctionValue)) {
@@ -282,9 +1181,8 @@
             literal: tValue.literal,
             properties: tValue.properties ? Object.keys(tValue.properties) : null,
             proto: tValue.proto ? tValue.proto.id : null,
-            isSet: tValue.isSet,
-            isRequired: tValue.isRequired,
-            isNative: tValue.isNative
+            source: tValue.source.key,
+            resolved: tValue.constructor !== UnresolvedValue
           });
         }
       }
@@ -293,10 +1191,12 @@
 
   function VM(pResolver) {
     this.resolver = pResolver;
+    this.program = new mAlphabetical.Program();
+    this.currentASTSource = this.currentExecutionSource = this.nativeSource = new Source('', []);
 
     createPrototypes(this);
 
-    var tGlobalObject = new Value(true, false, void 0, null, true);
+    var tGlobalObject = this.value(null);
 
     this.globalClosure = new Closure(this, new Reference(tGlobalObject), tGlobalObject, []);
 
@@ -305,8 +1205,12 @@
 
   tProto = VM.prototype;
 
+  tProto.reference = function(pValue) {
+    return new Reference(pValue);
+  }
+
   tProto.value = function(pPrototype) {
-    return new Value(true, false, void 0, pPrototype || this.objectPrototype, false);
+    return new Value(void 0, pPrototype === void 0 ? this.objectPrototype : pPrototype, this.currentASTSource, this.currentExecutionSource);
   };
 
   tProto.valueReference = function(pPrototype) {
@@ -314,18 +1218,22 @@
   };
 
   tProto.literalReference = function(pLiteral) {
-    return new Reference(new Value(true, false, pLiteral, this.objectPrototype, false));
+    return new Reference(new Value(pLiteral, this.objectPrototype, this.currentASTSource, this.currentExecutionSource));
   };
 
   tProto.undefinedReference = function() {
-    return new Reference(new Value(true, false, void 0, this.objectPrototype, false));
+    return new Reference(new Value(void 0, this.objectPrototype, this.currentASTSource, this.currentExecutionSource));
   };
 
-  tProto.requiredReference = function() {
-    return new Reference(new Value(false, true, void 0, this.objectPrototype, false));
+  tProto.functionReference = function(pParentClosures, pName, pArguments, pAST) {
+    return new Reference(new FunctionValue(this.vm, pParentClosures, pName, pArguments, pAST, this.currentASTSource, this.currentExecutionSource));
   };
 
-  tProto.execute = function(pAST) {
+  tProto.unresolvedReference = function() {
+    return new Reference(new UnresolvedValue(this.currentASTSource, this.currentExecutionSource));
+  };
+
+  tProto.execute = function(pSource) {
     this.globalClosure.execute(pAST);
   };
 
@@ -441,25 +1349,19 @@
 
   var mValueCounter = 0;
 
-  function Value(pIsSet, pIsRequired, pLiteral, pProtoValue, pIsNative) {
+  function Value(pLiteral, pProtoValue, pASTSource, pExecutionSource) {
     this.id = ++mValueCounter + '';
     this.literal = pLiteral;
     this.properties = null;
     this.proto = pProtoValue;
-    this.isSet = pIsSet;
-    this.isRequired = pIsRequired;
-    this.isNative = pIsNative;
+    this.astSource = pASTSource;
+    this.executionSource = pExecutionSource;
   }
 
   tProto = Value.prototype;
 
   tProto.setLiteral = function(pValue) {
     this.literal = pValue;
-    this.isSet = true;
-  };
-
-  tProto.require = function() {
-    this.isRequired = true;
   };
 
   tProto.setProperty = function(pName, pReference) {
@@ -542,8 +1444,8 @@
   /// Function Value
   /////////////////////////////
 
-  function FunctionValue(pVM, pParentClosures, pName, pArguments, pAST) {
-    Value.call(this, true, false, void 0, pVM.functionPrototype, false);
+  function FunctionValue(pVM, pParentClosures, pName, pArguments, pAST, pASTSource, pExecutionSource) {
+    Value.call(this, void 0, pVM.functionPrototype, pASTSource, pExecutionSource);
 
     this.vm = pVM;
     this.parentClosures = pParentClosures;
@@ -588,6 +1490,17 @@
   };
 
   /////////////////////////////
+  /// Unresolved Value
+  /////////////////////////////
+
+  function UnresolvedValue(pASTSource, pExecutionSource) {
+    Value.call(this, void 0, null, pASTSource, pExecutionSource);
+  }
+
+  tProto = UnresolvedValue.prototype = Object.create(Value.prototype);
+  tProto.constructor = UnresolvedValue;
+
+  /////////////////////////////
   /// NativeFunction Value
   /////////////////////////////
 
@@ -597,7 +1510,7 @@
         type: 'rejsNativeCallback',
         callback: pCallback
       }
-    ]);
+    ], pVM.nativeSource, pVM.nativeSource);
   }
 
   tProto = NativeFunctionValue.prototype = Object.create(FunctionValue.prototype);
@@ -626,6 +1539,7 @@
     this.locals = pLocals;
     this.parentClosures = pParentClosures;
     this.ast = null;
+    this.astSource = pVM.currentASTSource;
   }
 
   tProto = Closure.prototype;
@@ -634,7 +1548,7 @@
     var tParentClosures = this.parentClosures.slice(0);
     tParentClosures.push(this);
 
-    return new Reference(new FunctionValue(this.vm, tParentClosures, pName, pArguments, pAST));
+    return this.vm.functionReference(tParentClosures, pName, pArguments, pAST);
   };
 
   tProto.valueReference = function(pPrototype) {
@@ -646,7 +1560,7 @@
   };
 
   tProto.reference = function(pValue) {
-    return new Reference(pValue);
+    return this.vm.reference(pValue);
   };
 
   tProto.local = function(pName, pReference) {
@@ -657,8 +1571,8 @@
     return this.vm.undefinedReference();
   };
 
-  tProto.requiredReference = function() {
-    return this.vm.requiredReference();
+  tProto.unresolvedReference = function() {
+    return this.vm.unresolvedReference();
   };
 
   tProto.getReference = function(pName) {
