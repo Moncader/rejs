@@ -10,7 +10,7 @@ global.defaultRejsOptions = {
   },
   verbosity: 2,
   log: function(pVerbosity, pMessage) {
-    //console.log(pMessage);
+    console.log(pMessage);
   }
 };
 

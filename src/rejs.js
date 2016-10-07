@@ -80,14 +80,25 @@
     this.log = pOptions.log || defaultLog;
     this.verbosity = pOptions.verbosity || 0;
 
+    this.globalClosureReferences = pOptions.globalClosureReferences || [];
+
     this._stats = [];
+    this._statsMap = {};
+    this._exportMap = {};
+
+    this._namespaceValueExportMap = {};
+    this._namespaceValueRequireMap = {};
+    this._phase2References = [];
+    this._valueIdMap = {};
+
+    this.currentKey = null;
   }
 
   function ResolverKeyError(pKey, pMessage, pOriginalError) {
     this.key = pKey;
     this.message = pMessage;
     this.originalError = pOriginalError;
-    
+
     if (pOriginalError && pOriginalError.stack) {
       this.stack = pOriginalError.stack;
     }
@@ -170,16 +181,30 @@
       return 'Invalid source';
     }
 
+    var tBackupKey = pResolver.currentKey;
+
+    pResolver.currentKey = pKey;
+
     tVM = new VM(pResolver);
+    tVM.name = pKey;
+
+    // First AST Execution
     tVM.execute(tAST);
-    tStats = exportStats(tVM.globalClosure);
+
+    // Now export requirements and exports
+    tStats = exportStats(tVM.globalClosure, false, pKey);
 
     pResolver._stats.push({
       key: pKey,
-      data: tStats
+      data: tStats,
+      vm: tVM
     });
 
-    pResolver.writeCache(pKey, tStats);
+    pResolver._statsMap[pKey] = tStats;
+
+    updateVM(pResolver, tStats, pKey);
+
+    pResolver.currentKey = tBackupKey;
 
     return '';
   };
@@ -217,39 +242,49 @@
   /////////////////////////////////////////////////////////
   /// VM Code
   /////////////////////////////////////////////////////////
-  
+
   /////////////////////////////
   /// VM
   /////////////////////////////
 
   function createPrototypes(pVM) {
-    var tObjectPrototype = pVM.objectPrototype = new Value(true, false, void 0, null, true);
+    var tObjectPrototype = pVM.objectPrototype = new Value(pVM, true, false, void 0, null, true, pVM.resolver.currentKey);
     tObjectPrototype.properties = {};
 
-    var tFunctionPrototype = pVM.functionPrototype = new Value(true, false, void 0, tObjectPrototype, true);
+    var tFunctionPrototype = pVM.functionPrototype = new Value(pVM, true, false, void 0, tObjectPrototype, true, pVM.resolver.currentKey);
 
-    tFunctionPrototype.setProperty('call', new Reference(new NativeFunctionValue(pVM, function(pThisReference) {
-      var tCallee = this.thisReference;
+    tFunctionPrototype.setProperty(
+      'call',
+      new Reference(
+        new NativeFunctionValue(
+          pVM,
+          function(pThisReference) {
+            var tCallee = this.thisReference;
 
-      if (tCallee === null || !(tCallee.value instanceof FunctionValue)) {
-        return this.undefinedReference();
-      }
+            if (tCallee === null || !(tCallee.value instanceof FunctionValue)) {
+              return this.undefinedReference();
+            }
 
-      var tArguments = [];
-      var tArgumentsValueProperties = this.getReference('arguments').value.properties;
-      var i, il;
-      var tKeys;
+            var tArguments = [];
+            var tArgumentsValueProperties = this.getReference('arguments').value.properties;
+            var i, il;
+            var tKeys;
 
-      if (tArgumentsValueProperties !== null) {
-        tKeys = Object.keys(tArgumentsValueProperties);
+            if (tArgumentsValueProperties !== null) {
+              tKeys = Object.keys(tArgumentsValueProperties);
 
-        for (i = 1, il = tKeys.length; i < il; i++) {
-          tArguments[i - 1] = tArgumentsValueProperties[tKeys[i]];
-        }
-      }
+              for (i = 1, il = tKeys.length; i < il; i++) {
+                tArguments[i - 1] = tArgumentsValueProperties[tKeys[i]];
+              }
+            }
 
-      return tCallee.value.instance(pThisReference, tArguments).execute();
-    })));
+            return tCallee.value.instance(pThisReference, tArguments).execute();
+          }
+        ),
+        false,
+        pVM.resolver.currentKey
+      )
+    );
   }
 
   function createRejsNamespace(pVM) {
@@ -291,38 +326,56 @@
     }));
   }
 
+  function createGlobalClosureReferences(pVM, pGlobalValue, pReferences) {
+    for (var i = 0, il = pReferences.length; i < il; i++) {
+      pVM.globalClosure.local(pReferences[i], new Reference(pGlobalValue, false, pVM.resolver.currentKey));
+    }
+  }
+
   function VM(pResolver) {
+    this.name = '';
     this.resolver = pResolver;
+    this.callDepth = 0;
+    this.executedValueIds = {};
+    this.phase2ValueIds = {};
 
     createPrototypes(this);
 
-    var tGlobalObject = new Value(true, false, void 0, null, true);
+    var tGlobalObject = new Value(this, true, false, void 0, null, false, pResolver.currentKey);
 
-    this.globalClosure = new Closure(this, new Reference(tGlobalObject), tGlobalObject, []);
+    this.globalClosure = new Closure(this, new Reference(tGlobalObject, false, pResolver.currentKey), tGlobalObject, []);
 
     createRejsNamespace(this);
+
+    if (pResolver.globalClosureReferences) {
+      createGlobalClosureReferences(this, this.globalClosure.locals, pResolver.globalClosureReferences);
+    }
   }
 
   tProto = VM.prototype;
 
   tProto.value = function(pPrototype) {
-    return new Value(true, false, void 0, pPrototype || this.objectPrototype, false);
+    return new Value(this, true, false, void 0, pPrototype || this.objectPrototype, false, this.resolver.currentKey);
+  };
+
+  tProto.reference = function(pValue, pIsSet) {
+    return new Reference(pValue, pIsSet, this.resolver.currentKey);
   };
 
   tProto.valueReference = function(pPrototype) {
-    return new Reference(this.value(pPrototype));
+    return new Reference(this.value(pPrototype), false, this.resolver.currentKey);
   };
 
   tProto.literalReference = function(pLiteral) {
-    return new Reference(new Value(true, false, pLiteral, this.objectPrototype, false));
+    return new Reference(new Value(this, true, false, pLiteral, this.objectPrototype, false, this.resolver.currentKey), false, this.resolver.currentKey);
   };
 
   tProto.undefinedReference = function() {
-    return new Reference(new Value(true, false, void 0, this.objectPrototype, false));
+    return new Reference(new Value(this, true, false, void 0, this.objectPrototype, false, this.resolver.currentKey), false, this.resolver.currentKey);
   };
 
   tProto.requiredReference = function() {
-    return new Reference(new Value(false, true, void 0, this.objectPrototype, false));
+    return new Reference(new Value(this, false, true, void 0, this.objectPrototype, false, this.resolver.currentKey), false, this.resolver.currentKey);
   };
 
   tProto.execute = function(pAST) {
@@ -348,18 +401,18 @@
       } else if (pData instanceof Reference) {
         return pData;
       } else if (pData instanceof Value) {
-        return new Reference(pData);
+        return new Reference(pData, false, tVM.resolver.currentKey);
       } else {
         tType = typeof pData;
 
         if (tType === 'object') {
           if ((tIndex = tObjects.indexOf(pData)) >= 0) {
-            return new Reference(tValues[tIndex]);
+            return new Reference(tValues[tIndex], false, tVM.resolver.currentKey);
           }
 
           // Convert this object to our own system manually.
-          
-          tValue = new Value(true, false, void 0, pData.__proto__ === null ? null : wrap(pData.__proto__), true);
+
+          tValue = new Value(tVM, true, false, void 0, pData.__proto__ === null ? null : wrap(pData.__proto__), true, tVM.resolver.currentKey);
           tObjects.push(pData);
           tValues.push(tValue);
 
@@ -369,10 +422,10 @@
             tValue.setProperty(tKeys[i], wrap(pData[tKeys[i]]));
           }
 
-          return new Reference(tValue);
+          return new Reference(tValue, false, tVM.resolver.currentKey);
         } else if (tType === 'function') {
           if ((tIndex = tObjects.indexOf(pData)) >= 0) {
-            return new Reference(tValues[tIndex]);
+            return new Reference(tValues[tIndex], false, tVM.resolver.currentKey);
           }
 
           if (pConvertFunctions) {
@@ -385,7 +438,7 @@
           tObjects.push(pData);
           tValues.push(tValue);
 
-          return new Reference(tValue);
+          return new Reference(tValue, false, tVM.resolver.currentKey);
         } else {
           return tVM.literalReference(pData);
         }
@@ -441,7 +494,7 @@
 
   var mValueCounter = 0;
 
-  function Value(pIsSet, pIsRequired, pLiteral, pProtoValue, pIsNative) {
+  function Value(pVM, pIsSet, pIsRequired, pLiteral, pProtoValue, pIsNative, pReasonKey) {
     this.id = ++mValueCounter + '';
     this.literal = pLiteral;
     this.properties = null;
@@ -449,9 +502,79 @@
     this.isSet = pIsSet;
     this.isRequired = pIsRequired;
     this.isNative = pIsNative;
+    this.reasonKey = pReasonKey;
+    this.vm = pVM;
+
+    this._references = [];
+    this._isMerging = false;
   }
 
   tProto = Value.prototype;
+
+  tProto.remap = function(pOldValue) {
+    var i, il, tKeys, tKey;
+    var tProperties, tNewProperties;
+
+    if (this._isMerging === true || this === pOldValue) {
+      return;
+    }
+
+    this._isMerging = true;
+
+    var tOldReferences = pOldValue._references;
+    var tReferences = this._references;
+    var tReference;
+
+    for (i = 0, il = tOldReferences.length; i < il; i++) {
+      tReference = tOldReferences[i];
+      tReference.value = this;
+      tReferences.push(tReference);
+    }
+
+    tOldReferences.length = 0;
+
+    this.literal = pOldValue.literal;
+
+    //this.isRequired = !!(this.isRequired & pOldValue.isRequired);
+    //this.isSet = !!(this.isSet | pOldValue.isSet);
+
+    if (this.proto !== pOldValue.proto) {
+      if (this.proto === null) {
+        this.proto = pOldValue.proto;
+      } else if (pOldValue.proto !== null) {
+        this.proto.remap(pOldValue.proto);
+      }
+    }
+
+    tProperties = this.properties;
+    tNewProperties = pOldValue.properties;
+
+    if (tProperties !== null && tNewProperties !== null) {
+      tKeys = Object.keys(tNewProperties);
+
+      for (i = 0, il = tKeys.length; i < il; i++) {
+        tKey = tKeys[i];
+
+        if (tProperties.hasOwnProperty(tKey) === true) {
+          if (tProperties[tKey].value.isRequired === true && tNewProperties[tKey].value.isRequired === false) {
+            // Merging something that was complete with something that isn't.
+            // Use the complete one.
+            tNewProperties[tKey].value.remap(tProperties[tKey].value);
+          } else {
+            // For any other state, just do a regular remap.
+            // Don't care if both were isRequired false...
+            tProperties[tKey].value.remap(tNewProperties[tKey].value);
+          }
+        } else {
+          tProperties[tKey] = tNewProperties[tKey];
+        }
+      }
+    } else if (tNewProperties !== null) {
+      this.properties = tNewProperties;
+    }
+
+    this._isMerging = false;
+  };
 
   tProto.setLiteral = function(pValue) {
     this.literal = pValue;
@@ -472,15 +595,19 @@
     var tProperties = this.properties;
     var tProto;
 
-    if (tProperties !== null && pName in tProperties) {
-      return tProperties[pName];
+    if (tProperties !== null && tProperties.hasOwnProperty(pName) === true) {
+      return this.vm.reference(tProperties[pName].value, false);
     }
 
     for (tProto = this.proto; tProto !== null; tProto = tProto.proto) {
       tProperties = tProto.properties;
 
-      if (tProperties !== null && pName in tProperties) {
-        return tProperties[pName];
+      if (tProperties !== null && tProperties.hasOwnProperty(pName) === true) {
+        return this.vm.reference(tProperties[pName].value, false);
+      }
+
+      if (tProto.proto === tProto) {
+        break;
       }
     }
 
@@ -543,9 +670,8 @@
   /////////////////////////////
 
   function FunctionValue(pVM, pParentClosures, pName, pArguments, pAST) {
-    Value.call(this, true, false, void 0, pVM.functionPrototype, false);
+    Value.call(this, pVM, true, false, void 0, pVM.functionPrototype, false);
 
-    this.vm = pVM;
     this.parentClosures = pParentClosures;
     this.name = pName;
     this.args = pArguments;
@@ -558,7 +684,7 @@
   tProto.constructor = FunctionValue;
 
   tProto.instance = function(pThisReference, pArguments) {
-    var tInstance = new Closure(this.vm, pThisReference, this.vm.value(), this.parentClosures);
+    var tInstance = new Closure(this.vm, pThisReference ? new Reference(pThisReference.value, false, this.vm.resolver.currentKey) : void 0, this.vm.value(), this.parentClosures, this);
     var tArgumentsReference = tInstance.valueReference();
     var tArgumentsValue = tArgumentsReference.value;
     var tArgumentNames;
@@ -567,11 +693,11 @@
     tInstance.ast = this.ast;
 
     if (this.name) {
-      tInstance.local(this.name, new Reference(this));
+      tInstance.local(this.name, new Reference(this, false, this.vm.resolver.currentKey));
     }
 
     for (i = 0, il = pArguments.length; i < il; i++) {
-      tArgumentsValue.setProperty(i + '', pArguments[i]);
+      tArgumentsValue.setProperty(i + '', pArguments[i] ? tInstance.reference(pArguments[i].value) : pArguments[i]);
     }
 
     tInstance.local('arguments', tArgumentsReference);
@@ -580,7 +706,7 @@
 
     if (tArgumentNames) {
       for (i = 0, il = tArgumentNames.length; i < il; i++) {
-        tInstance.local(tArgumentNames[i], pArguments[i] || this.vm.undefinedReference());
+        tInstance.local(tArgumentNames[i], pArguments[i] ? tInstance.reference(pArguments[i].value) : this.vm.undefinedReference());
       }
     }
 
@@ -605,27 +731,42 @@
 
   /////////////////////////////
   /// References
-  /////////////////////////////  
+  /////////////////////////////
 
-  function Reference(pValue) {
+  function Reference(pValue, pIsSet, pReasonKey) {
     this.value = pValue;
-    this.isSet = false;
+    this.isSet = !!pIsSet;
+    this.binding = null;
+    this.phase2 = null;
+    this.reasonKey = pReasonKey;
+
+    pValue._references.push(this);
   }
 
   tProto = Reference.prototype;
+
+  tProto.registerPhase2 = function(pClosure, pIsNew, pArguments) {
+    var tPhase2 = this.phase2 || (this.phase2 = []);
+
+    tPhase2.push({
+      closure: pClosure,
+      isNew: pIsNew,
+      arguments: pArguments
+    });
+  };
 
   /////////////////////////////
   /// Closures
   /////////////////////////////
 
-  function Closure(pVM, pThisReference, pLocals, pParentClosures) {
+  function Closure(pVM, pThisReference, pLocals, pParentClosures, pFunctionValue) {
     this.vm = pVM;
-    this.thisReference = pThisReference || new Reference(pVM.globalClosure.locals);
-    this.futureThisReference = null;
+    this.thisReference = pThisReference || new Reference(pVM.globalClosure.locals, false, pVM.resolver.currentKey);
     this.returnReference = this.undefinedReference();
     this.locals = pLocals;
     this.parentClosures = pParentClosures;
     this.ast = null;
+    this.functionValue = pFunctionValue || null;
   }
 
   tProto = Closure.prototype;
@@ -634,7 +775,7 @@
     var tParentClosures = this.parentClosures.slice(0);
     tParentClosures.push(this);
 
-    return new Reference(new FunctionValue(this.vm, tParentClosures, pName, pArguments, pAST));
+    return new Reference(new FunctionValue(this.vm, tParentClosures, pName, pArguments, pAST), false, this.vm.resolver.currentKey);
   };
 
   tProto.valueReference = function(pPrototype) {
@@ -646,7 +787,7 @@
   };
 
   tProto.reference = function(pValue) {
-    return new Reference(pValue);
+    return new Reference(pValue, false, this.vm.resolver.currentKey);
   };
 
   tProto.local = function(pName, pReference) {
@@ -683,6 +824,30 @@
     return null;
   };
 
+  tProto.executeFunction = function(pFunctionValue, pIsNew, pArguments, pBinding) {
+    var tThisReference;
+    var tCalleeInstance;
+
+    if (pIsNew === true) {
+      tThisReference = this.valueReference(pFunctionValue.getProperty('prototype').value);
+      tThisReference.value.properties = {};
+
+      tCalleeInstance = pFunctionValue.instance(tThisReference, pArguments);
+      tCalleeInstance.execute();
+
+      return tThisReference;
+    }
+
+    if (pBinding !== null) {
+      tThisReference = pBinding;
+    }
+
+    tCalleeInstance = pFunctionValue.instance(tThisReference, pArguments);
+    tCalleeInstance.execute();
+
+    return tCalleeInstance.returnReference;
+  };
+
   tProto.wrap = function(pData) {
     return this.vm.wrap(pData);
   };
@@ -697,9 +862,12 @@
     var tType;
     var i, il, j, jl;
     var tKeys;
+    var tKey;
     var tValue;
     var tArguments;
     var tReference;
+
+    pClosure.vm.callDepth++;
 
     if (pAST.__proto__ !== Array.prototype) {
       tASTList = [pAST];
@@ -735,7 +903,13 @@
         tKeys = Object.keys(tAST);
 
         for (j = 0, jl = tKeys.length; j < jl; j++) {
-          tValue = tAST[tKeys[j]];
+          tKey = tKeys[j];
+
+          if (tKey === 'start' || tKey === 'end' || tKey === 'type') {
+            continue;
+          }
+
+          tValue = tAST[tKey];
 
           if (typeof tValue === 'object' && tValue !== null) {
             preprocessAST(pClosure, tValue);
@@ -743,6 +917,8 @@
         }
       }
     }
+
+    pClosure.vm.callDepth--;
   }
 
   function interpret(pClosure, pAST) {
@@ -781,8 +957,6 @@
             tResult = interpret(pClosure, tAST[tASTProperties[j]]);
           }
         }
-        // Panic for now.
-        //throw new Error('Unsupported AST Type: ' + tType);
       }
     }
 
@@ -790,11 +964,25 @@
   }
 
   tProto.execute = function(pAST) {
+    if (this.functionValue !== null) {
+      if (this.functionValue.id in this.vm.executedValueIds) {
+        // Don't allow an already executed function
+        // to be executed again. We'll get an infinite loop.
+        //return this.vm.executedValueIds[this.functionValue.id];
+      }
+    }
+
     pAST = pAST || this.ast || [];
 
     preprocessAST(this, pAST);
 
-    return interpret(this, pAST);
+    var tResult = interpret(this, pAST);
+
+    if (this.functionValue !== null) {
+      this.vm.executedValueIds[this.functionValue.id] = tResult;
+    }
+
+    return tResult;
   };
 
 
@@ -827,54 +1015,55 @@
     return interpret(this, pAST.expression);
   };
 
-  tProto.EmptyExpression = function(pAST) {
+  tProto.SequenceExpression = function(pAST) {
+    var tExpressions = pAST.expressions;
+    var i, il;
+    var tResult;
+
+    for (i = 0, il = tExpressions.length; i < il; i++) {
+      tResult = interpret(this, tExpressions[i]);
+    }
+
+    return tResult;
+  };
+
+  tProto.EmptyExpression = tProto.EmptyStatement = function(pAST) {
     return this.literalReference(0);
   };
 
   tProto.NewExpression = tProto.CallExpression = function(pAST) {
     var tArgumentsAST = pAST.arguments;
     var tArguments = [];
-    var tCalleeValue;
-    var tCalleeInstance;
-    var tThisReference;
+    var tArgument;
+    var tCalleeReference, tCalleeValue;
     var i, il;
 
     for (i = 0, il = tArgumentsAST.length; i < il; i++) {
       tArguments[i] = interpret(this, tArgumentsAST[i]);
     }
 
-    tCalleeValue = interpret(this, pAST.callee).value;
-
-
+    tCalleeReference = interpret(this, pAST.callee);
+    tCalleeValue = tCalleeReference.value;
 
     if (!(tCalleeValue instanceof FunctionValue)) {
       if (tCalleeValue.isSet === false) {
-        //tCalleeValue
+        // Register this function as something we
+        // need to execute again once it has been resolved
+        // in to the VM. It's possible there are side effects
+        // on objects we pass in to this function as arguments.
+        // It's also possible to there are side effects on the
+        // file this function came from as well.
+        tCalleeReference.registerPhase2(this, pAST.type === 'NewExpression', tArguments);
       }
 
-      // TODO: Do we need to track this to to resolve
-      // order later?
-      return this.requiredReference();
+      // Can't call this...
+      // Since we aren't a full VM we should assume
+      // that our VM messed up somewhere
+      // and just ignore this.
+      return this.undefinedReference();
     }
 
-    if (pAST.type === 'NewExpression') {
-      tThisReference = this.valueReference(tCalleeValue.getProperty('prototype').value);
-      tThisReference.value.properties = {};
-
-      tCalleeInstance = tCalleeValue.instance(tThisReference, tArguments);
-      tCalleeInstance.execute();
-
-      return tThisReference;
-    }
-
-    if (this.futureThisReference !== null) {
-      tThisReference = this.futureThisReference;
-    }
-
-    tCalleeInstance = tCalleeValue.instance(tThisReference, tArguments);
-    tCalleeInstance.execute();
-
-    return tCalleeInstance.returnReference;
+    return this.executeFunction(tCalleeValue, pAST.type === 'NewExpression', tArguments, tCalleeReference.binding);
   };
 
   tProto.FunctionExpression = function(pAST) {
@@ -887,6 +1076,39 @@
     }
 
     return this.functionReference(pAST.id ? pAST.id.name : void 0, tArguments, pAST.body);
+  };
+
+  tProto.TryStatement = function(pAST) {
+    var tResult = this.undefinedReference();
+
+    if (pAST.block) {
+      tResult = interpret(this, pAST.block);
+    }
+
+    if (pAST.handler) {
+      interpret(this, pAST.handler);
+    }
+
+    if (pAST.finalizer) {
+      interpret(this, pAST.finalizer);
+    }
+
+    return tResult;
+  };
+
+  tProto.CatchClause = function(pAST) {
+    var tResult = this.undefinedReference();
+
+    if (pAST.pattern) {
+      // How does this work?
+      interpret(this, pAST.pattern);
+    }
+
+    if (pAST.body) {
+      tResult = interpret(this, pAST.body);
+    }
+
+    return tResult;
   };
 
   tProto.VariableDeclaration = function(pAST) {
@@ -918,6 +1140,9 @@
 
     switch (tOperator) {
       case '=':
+        if (!tRightReference.value) {
+          console.log('OUCH1');
+        }
         tLeftReference.value = tRightReference.value;
         tLeftReference.isSet = true;
 
@@ -975,12 +1200,12 @@
     return tLeftReference;
   };
 
-  tProto.BinaryExpression = function(pAST) {
+  tProto.BinaryExpression = tProto.LogicalExpression = function(pAST) {
     var tLeftValue = interpret(this, pAST.left).value;
     var tRightValue = interpret(this, pAST.right).value;
     var tOperator = pAST.operator;
     var tResult;
-    
+
     switch (tOperator) {
       case '+':
         tResult = tLeftValue.asPrimitive() + tRightValue.asPrimitive();
@@ -1014,6 +1239,10 @@
         tResult = tLeftValue.asNumber() >>> tRightValue.asNumber();
 
         break;
+      case '&&':
+        return this.reference(tLeftValue.asBoolean() ? tRightValue : tLeftValue);
+      case '||':
+        return this.reference(tLeftValue.asBoolean() ? tLeftValue : tRightValue);
       case '<':
       case '>':
       case '<=':
@@ -1022,8 +1251,6 @@
       case '===':
       case '!=':
       case '!==':
-      case '&&':
-      case '||':
       case 'instanceof':
       case 'in':
         // The result of all of this is a boolean that
@@ -1053,7 +1280,7 @@
 
         break;
     }
-    
+
 
     return this.literalReference(tResult);
   };
@@ -1093,7 +1320,7 @@
 
         break;
     }
-    
+
     return this.undefinedReference();
   };
 
@@ -1125,7 +1352,7 @@
       tPropertyReference = interpret(this, pAST.property);
 
       if (!tPropertyReference.value.isSet) {
-        this.log(0, 'Used an unresolved computed property in a MemberExpression. Possible resolution failure ahead!');
+        this.log(1, 'Used an unresolved computed property in a MemberExpression. Possible resolution failure ahead!');
 
         return this.undefinedReference();
       }
@@ -1138,7 +1365,7 @@
         tPropertyReference = interpret(this, pAST.property);
 
         if (!tPropertyReference.value.isSet) {
-          this.log(0, 'Used an unresolved computed property in a MemberExpression. Possible resolution failure ahead!');
+          this.log(1, 'Used an unresolved computed property in a MemberExpression. Possible resolution failure ahead!');
 
           return this.undefinedReference();
         }
@@ -1154,7 +1381,7 @@
       tObjectReference.value.setProperty(tName, tReference);
     }
 
-    this.futureThisReference = tObjectReference;
+    tReference.binding = tObjectReference;
 
     return tReference;
   };
@@ -1180,7 +1407,7 @@
   };
 
   tProto.ObjectExpression = function(pAST) {
-    var tObjectValue = new Value(true, false, void 0, this.vm.objectPrototype, false);
+    var tObjectValue = new Value(this.vm, true, false, void 0, this.vm.objectPrototype, false, this.vm.resolver.currentKey);
     var tProperties = pAST.properties;
     var i, il;
 
@@ -1194,7 +1421,7 @@
   };
 
   tProto.ArrayExpression = function(pAST) {
-    var tArrayValue = new Value(true, false, void 0, this.vm.objectPrototype, false);
+    var tArrayValue = new Value(this.vm, true, false, void 0, this.vm.objectPrototype, false, this.vm.resolver.currentKey);
     var tElements = pAST.elements;
     var i, il;
 
@@ -1207,7 +1434,7 @@
     return this.reference(tArrayValue);
   };
 
-  tProto.IfStatement = function(pAST) {
+  tProto.IfStatement = tProto.ConditionalExpression = function(pAST) {
     var tTestResult = interpret(this, pAST.test);
     var tConsequent = interpret(this, pAST.consequent);
 
@@ -1221,12 +1448,38 @@
     return tConsequent;
   };
 
+  tProto.SwitchCase = function(pAST) {
+    var tTestResult = interpret(this, pAST.test);
+    var tConsequents = pAST.consequent;
+    var tResult = this.undefinedReference();
+    var i, il;
+
+    for (i = 0, il = tConsequents.length; i < il; i++) {
+      tResult = interpret(this, tConsequents[i]);
+    }
+
+    return tResult;
+  };
+
+  tProto.SwitchStatement = function(pAST) {
+    var tDiscriminant = interpret(this, pAST.discriminant);
+    var tCases = pAST.cases;
+    var tResult = this.undefinedReference();
+    var i, il;
+
+    for (i = 0, il = tCases.length; i < il; i++) {
+      tResult = interpret(this, tCases[i]);
+    }
+
+    return tResult;
+  };
+
   tProto.ForInStatement = function(pAST) {
     var tLeft = interpret(this, pAST.left);
     var tRight = interpret(this, pAST.right);
 
     // TODO: Provide option to actually run this loop.
-    
+
     var tResult = interpret(this, pAST.body);
 
     if (!tRight.isSet) {
@@ -1260,6 +1513,47 @@
     return tResult;
   };
 
+  tProto.WhileStatement = function(pAST) {
+    var tTest;
+    var tResult = this.undefinedReference();
+
+    if (pAST.test) {
+      tTest = interpret(this, pAST.test);
+    }
+
+    if (pAST.body) {
+      tResult = interpret(this, pAST.body);
+    }
+
+    return tResult;
+  };
+
+  tProto.DoWhileStatement = function(pAST) {
+    var tTest;
+    var tResult = this.undefinedReference();
+
+    if (pAST.body) {
+      tResult = interpret(this, pAST.body);
+    }
+
+    if (pAST.test) {
+      tTest = interpret(this, pAST.test);
+    }
+
+    return tResult;
+  };
+
+  tProto.BreakStatement = tProto.ContinueStatement = function(pAST) {
+    // Don't really care about breaks and continues...
+    return this.undefinedReference();
+  };
+
+  tProto.LabeledStatement = function(pAST) {
+    var tResult = interpret(this, pAST.body);
+
+    return tResult;
+  };
+
   tProto.ReturnStatement = function(pAST) {
     var tReturnReference;
 
@@ -1274,34 +1568,94 @@
     return tReturnReference;
   };
 
-  function exportStats(pClosure) {
+  function exportStats(pClosure, pOnlyNewValues, pReasonKey) {
     var tCache = {};
+    var tNamespaceExportMap = pClosure.vm.resolver._namespaceValueExportMap;
+    var tNamespaceRequireMap = pClosure.vm.resolver._namespaceValueRequireMap;
     var tNamespaceStack = [];
     var tRequires = [];
     var tExports = [];
+    var tExportValues = {};
+    //var tRequiredReferences = {};
+    var tRequiredValues = {};
+    var tPhase2References = [];
     var tRootValue = true;
 
     function exportValue(pReference) {
       var tValue = pReference.value;
+      var tValueId = tValue.id;
+      var tNamespace;
       var tKeys;
       var tProperties;
       var i, il;
 
       if (tRootValue === false) {
         if (pReference.isSet === true && tValue.isNative === false) {
-          tExports.push(tNamespaceStack.join('.'));
+          tNamespace = tNamespaceStack.join('.');
 
-          if (tValue.id in tCache) {
+          if (tValue.isRequired === true && pReasonKey === pReference.reasonKey) {
+            //tRequiredReferences[tNamespace] = pReference;
+            tRequiredValues[tNamespace] = new Reference(tValue, false, null);
+          }
+
+          if (pReference.phase2 !== null && pReasonKey === pReference.reasonKey) {
+            // Need to pass this value on to
+            // phase 2.
+            tPhase2References.push(pReference);
+          }
+
+          if (pOnlyNewValues === false) {
+            tExports.push(tNamespace);
+            tExportValues[tNamespace] = tValue;
+          } else {
+            if (pReasonKey === pReference.reasonKey && tNamespaceExportMap.hasOwnProperty(tNamespace) === false) {
+              tExports.push(tNamespace);
+              tExportValues[tNamespace] = tValue;
+            } else if (pReasonKey !== pReference.reasonKey) {
+              //console.log('DEAD', tNamespace, pReasonKey, pReference.reasonKey);
+            }
+
+            //if (pReasonKey !== pReference.reasonKey) {
+//              tExportValues[tNamespace] = tValue;
+            //}
+
+          }
+
+          if (tValueId in tCache) {
             return;
           }
         } else if (tValue.isRequired === true && tValue.isNative === false && !(tValue.id in tCache)) {
-          tRequires.push(tNamespaceStack.join('.'));
+          tNamespace = tNamespaceStack.join('.');
+
+          if (pOnlyNewValues === false || tNamespaceRequireMap.hasOwnProperty(tNamespace) === false) {
+            if (pReasonKey === pReference.reasonKey) {
+              tRequires.push(tNamespace);
+              //RequiredReferences[tNamespace] = pReference;
+              tRequiredValues[tNamespace] = new Reference(tValue, false, null);
+            }
+
+            if (pReference.phase2 !== null && pReasonKey === pReference.reasonKey) {
+              // Need to pass this value on to
+              // phase 2.
+              tPhase2References.push(pReference);
+            }
+          } else {
+            if (pReasonKey === pReference.reasonKey) {
+              //tRequiredValues[tNamespace] = new Reference(tValue, false, null);
+            }
+          }
+        } else if (tValueId in tCache) {
+          if (tValue.isRequired === true && pReasonKey === pReference.reasonKey) {
+            //tRequiredValues[tNamespace] = new Reference(tValue, false, null);
+          }
+
+          return;
         }
       } else {
         tRootValue = false;
       }
 
-      tCache[tValue.id] = tValue;
+      tCache[tValueId] = tValue;
 
       tProperties = tValue.properties;
 
@@ -1320,12 +1674,175 @@
       }
     }
 
-    exportValue(new Reference(pClosure.locals));
+    exportValue(new Reference(pClosure.locals, false, pReasonKey));
 
     return {
       requires: tRequires,
-      exports: tExports
+      exports: tExports,
+      //requiredReferences: tRequiredReferences,
+      requiredValues: tRequiredValues,
+      exportedValues: tExportValues,
+      phase2References: tPhase2References
     };
+  }
+
+  function updateVM(pResolver, pStats, pKey) {
+    var tNamespaceRequireMap = pResolver._namespaceValueRequireMap;
+    var tNamespaceExportMap = pResolver._namespaceValueExportMap;
+    var tPhase2References = pResolver._phase2References;
+    var tValueIdMap = pResolver._valueIdMap;
+    var tSideEffects = false;
+    var tPhase2Data;
+    var tKeys, tKey;
+    var tReferences, tReference, tValue;
+    var i, il, j, jl;
+
+    phase2loop: for (i = 0, il = pStats.phase2References.length; i < il; i++) {
+      for (j = 0, jl = tPhase2References.length; j < jl; j++) {
+        if (tPhase2References[j] === pStats.phase2References[i]) {
+          continue phase2loop;
+        }
+      }
+
+      tPhase2References.push(pStats.phase2References[i]);
+    }
+
+    tKeys = Object.keys(pStats.requiredValues);
+
+    for (i = 0, il = tKeys.length; i < il; i++) {
+      tKey = tKeys[i];
+      tValue = pStats.requiredValues[tKey].value;
+
+      pResolver.log(3, pKey, 'NEW REQUIRE: ', tKey, tValue.id);
+
+      if (tNamespaceRequireMap.hasOwnProperty(tKey) === true) {
+        pResolver.log(3, 'had that...');
+
+        if (tValue.isRequired === false) {
+          // This was remapped inline and is now solved.
+          pResolver.log(3, 'Remapping', tNamespaceRequireMap[tKey].id, tValue.id);
+
+          tValue.remap(tNamespaceRequireMap[tKey]);
+          tNamespaceRequireMap[tKey] = tValue;
+        } else {
+          pResolver.log(3, 'Remapping', tValue.id, tNamespaceRequireMap[tKey].id);
+
+          tNamespaceRequireMap[tKey].remap(tValue);
+        }
+      } else if (tNamespaceExportMap.hasOwnProperty(tKey) === true) {
+        pResolver.log(3, 'already solved that...');
+        pResolver.log(3, 'Remapping', tValue.id, tNamespaceExportMap[tKey].id);
+
+        tNamespaceExportMap[tKey].remap(tValue);
+        tNamespaceRequireMap[tKey] = tNamespaceExportMap[tKey];
+      } else {
+        tNamespaceRequireMap[tKey] = tValue;
+      }
+    }
+
+    // Build the map for VM values to global namespaces.
+    tKeys = Object.keys(pStats.exportedValues);
+
+    for (i = 0, il = tKeys.length; i < il; i++) {
+      tKey = tKeys[i];
+      tValue = tNamespaceExportMap[tKey] = pStats.exportedValues[tKey];
+
+      // Next, for anybody in the require map waiting for this
+      // key, update their values.
+      if (tValue.isRequired === false) {
+        pResolver.log(3, pKey, 'Defined ', tKey, tValue.id);
+
+        if (tNamespaceRequireMap.hasOwnProperty(tKey) === true) {
+          pResolver.log(3, pKey, 'Updating...');
+          pResolver.log(3, 'Remapping', tNamespaceRequireMap[tKey].id, tValue.id);
+
+          tValue.remap(tNamespaceRequireMap[tKey]);
+          tNamespaceRequireMap[tKey] = tValue;
+        }
+      }
+    }
+
+    //console.log('check phase2');
+    // Next, try to re-resolve the system if
+    // there is anything that needs resolving.
+    for (i = 0, il = tPhase2References.length; i < il; i++) {
+      tReference = tPhase2References[i];
+      tValue = tReference.value;
+
+      //console.log('PHASE2', tReference.phase2 !== null, tValue.id);
+
+      if (tReference.phase2 === null) {
+        // We processed this already. Ignore
+        tPhase2References.splice(i, 1);
+        i--;
+        il--;
+
+        continue;
+      }
+
+      if (tValue.isRequired === false) {
+        // This is a resolved value now. w00t.
+        // Use it, and execute the function.
+        pResolver.log(3, 'Found ' + tValue.id + ' in exports. EXECUTE');
+
+        tSideEffects = true;
+        tPhase2Data = tReference.phase2;
+        tReference.phase2 = null;
+
+        for (j = 0, jl = tPhase2Data.length; j < jl; j++) {
+          var tBackupKey = pResolver.currentKey;
+          //pResolver.currentKey = tReference.reasonKey;
+          pResolver.currentKey = tPhase2Data[j].closure.vm.name;
+          if (pResolver.currentKey === '/home/jason/work/lespas-web/src/js/lespas/app.js') {
+            console.log("START HERE YOU FIEND");
+          }
+          tPhase2Data[j].closure.executeFunction(tValue, tPhase2Data[j].isNew, tPhase2Data[j].arguments, tReference.binding);
+          pResolver.currentKey = tBackupKey;
+        }
+
+        // Done with this reference.
+        tPhase2References.splice(i, 1);
+        i--;
+        il--;
+
+        pResolver.log(3, 'Found ' + tValue.id + ' in exports. EXECUTE DONE');
+      }
+    }
+
+    if (tSideEffects === true) {
+      // The maps are all set up.
+      // Try updating all stats again.
+      updateStats(pResolver);
+    }
+  }
+
+  function updateStats(pResolver) {
+    var tStatsList = pResolver._stats;
+    var tStats;
+    var tData;
+    var tBackupKey;
+    var i, il, j, jl;
+
+    for (i = 0, il = tStatsList.length; i < il; i++) {
+      tStats = exportStats(tStatsList[i].vm.globalClosure, true, tStatsList[i].key);
+      tData = tStatsList[i].data;
+
+      for (j = 0, jl = tStats.requires.length; j < jl; j++) {
+        if (tData.requires.indexOf(tStats.requires[j]) === -1) {
+          tData.requires.push(tStats.requires[j]);
+        }
+      }
+
+      for (j = 0, jl = tStats.exports.length; j < jl; j++) {
+        if (tData.exports.indexOf(tStats.exports[j]) === -1) {
+          tData.exports.push(tStats.exports[j]);
+        }
+      }
+
+      updateVM(pResolver, tStats, pResolver.currentKey);
+
+      pResolver.writeCache(tStatsList[i].key, tData);
+    }
   }
 
   function printUnsortedStats(pResolver) {
@@ -1507,7 +2024,7 @@
       // Finally we just append the remaining
       // sources that require something but
       // it was never defined in our sources.
-      
+
       tKeys = Object.keys(cRequireMap);
 
       for (i = tKeys.length - 1; i >= 0; i--) {
