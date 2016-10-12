@@ -1,6 +1,6 @@
 {
   "name": "rejs",
-  "version": "0.0.4",
+  "version": "0.8.1",
   "description": "Resolve JavaScript file order.",
   "main": "src/rejs.js",
   "bin": {
@@ -16,13 +16,19 @@
     "dependency",
     "resolve"
   ],
+  "scripts": {
+    "test": "node node_modules/jasmine/bin/jasmine.js JASMINE_CONFIG_PATH=tests/support/jasmine.json"
+  },
   "author": "Moncader",
   "license": "Zlib",
   "bugs": {
     "url": "https://github.com/Moncader/rejs/issues"
   },
   "dependencies": {
-    "acorn": "~0.5.0",
-    "optimist": "^0.6.1"
+    "acorn": "^4.0.3",
+    "yargs": "^5.0.0"
+  },
+  "devDependencies": {
+    "jasmine": "^2.1.1"
   }
 }
