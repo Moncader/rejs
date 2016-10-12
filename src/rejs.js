@@ -255,7 +255,7 @@
 
     tFunctionPrototype.setProperty(
       'call',
-      new Reference(
+      pVM.reference(
         new NativeFunctionValue(
           pVM,
           function(pThisReference) {
@@ -281,8 +281,7 @@
             return tCallee.value.instance(pThisReference, tArguments).execute();
           }
         ),
-        false,
-        pVM.resolver.currentKey
+        false
       )
     );
   }
@@ -322,13 +321,16 @@
             isNative: tValue.isNative
           });
         }
+      },
+      debugger: function() {
+        debugger;
       }
     }));
   }
 
   function createGlobalClosureReferences(pVM, pGlobalValue, pReferences) {
     for (var i = 0, il = pReferences.length; i < il; i++) {
-      pVM.globalClosure.local(pReferences[i], new Reference(pGlobalValue, false, pVM.resolver.currentKey));
+      pVM.globalClosure.local(pReferences[i], pVM.reference(pGlobalValue, false));
     }
   }
 
@@ -343,7 +345,7 @@
 
     var tGlobalObject = new Value(this, true, false, void 0, null, false, pResolver.currentKey);
 
-    this.globalClosure = new Closure(this, new Reference(tGlobalObject, false, pResolver.currentKey), tGlobalObject, []);
+    this.globalClosure = new Closure(this, this.reference(tGlobalObject, false), tGlobalObject, []);
 
     createRejsNamespace(this);
 
@@ -596,14 +598,14 @@
     var tProto;
 
     if (tProperties !== null && tProperties.hasOwnProperty(pName) === true) {
-      return this.vm.reference(tProperties[pName].value, false);
+      return tProperties[pName];
     }
 
     for (tProto = this.proto; tProto !== null; tProto = tProto.proto) {
       tProperties = tProto.properties;
 
       if (tProperties !== null && tProperties.hasOwnProperty(pName) === true) {
-        return this.vm.reference(tProperties[pName].value, false);
+        return tProperties[pName];
       }
 
       if (tProto.proto === tProto) {
@@ -1140,11 +1142,9 @@
 
     switch (tOperator) {
       case '=':
-        if (!tRightReference.value) {
-          console.log('OUCH1');
-        }
         tLeftReference.value = tRightReference.value;
         tLeftReference.isSet = true;
+        tLeftReference.reasonKey = this.vm.resolver.currentKey;
 
         break;
       case '*=':
@@ -1576,7 +1576,6 @@
     var tRequires = [];
     var tExports = [];
     var tExportValues = {};
-    //var tRequiredReferences = {};
     var tRequiredValues = {};
     var tPhase2References = [];
     var tRootValue = true;
@@ -1585,7 +1584,7 @@
       var tValue = pReference.value;
       var tValueId = tValue.id;
       var tNamespace;
-      var tKeys;
+      var tKeys, tKey;
       var tProperties;
       var i, il;
 
@@ -1594,7 +1593,6 @@
           tNamespace = tNamespaceStack.join('.');
 
           if (tValue.isRequired === true && pReasonKey === pReference.reasonKey) {
-            //tRequiredReferences[tNamespace] = pReference;
             tRequiredValues[tNamespace] = new Reference(tValue, false, null);
           }
 
@@ -1611,14 +1609,7 @@
             if (pReasonKey === pReference.reasonKey && tNamespaceExportMap.hasOwnProperty(tNamespace) === false) {
               tExports.push(tNamespace);
               tExportValues[tNamespace] = tValue;
-            } else if (pReasonKey !== pReference.reasonKey) {
-              //console.log('DEAD', tNamespace, pReasonKey, pReference.reasonKey);
             }
-
-            //if (pReasonKey !== pReference.reasonKey) {
-//              tExportValues[tNamespace] = tValue;
-            //}
-
           }
 
           if (tValueId in tCache) {
@@ -1630,7 +1621,6 @@
           if (pOnlyNewValues === false || tNamespaceRequireMap.hasOwnProperty(tNamespace) === false) {
             if (pReasonKey === pReference.reasonKey) {
               tRequires.push(tNamespace);
-              //RequiredReferences[tNamespace] = pReference;
               tRequiredValues[tNamespace] = new Reference(tValue, false, null);
             }
 
@@ -1639,16 +1629,8 @@
               // phase 2.
               tPhase2References.push(pReference);
             }
-          } else {
-            if (pReasonKey === pReference.reasonKey) {
-              //tRequiredValues[tNamespace] = new Reference(tValue, false, null);
-            }
           }
         } else if (tValueId in tCache) {
-          if (tValue.isRequired === true && pReasonKey === pReference.reasonKey) {
-            //tRequiredValues[tNamespace] = new Reference(tValue, false, null);
-          }
-
           return;
         }
       } else {
@@ -1666,9 +1648,16 @@
       tKeys = Object.keys(tProperties);
 
       for (i = 0, il = tKeys.length; i < il; i++) {
-        tNamespaceStack.push(tKeys[i]);
+        tKey = tKeys[i];
 
-        exportValue(tProperties[tKeys[i]]);
+        if (tKey[0] === '_') {
+          // rejs ignores these.
+          continue;
+        }
+
+        tNamespaceStack.push(tKey);
+
+        exportValue(tProperties[tKey]);
 
         tNamespaceStack.pop();
       }
@@ -1762,14 +1751,11 @@
       }
     }
 
-    //console.log('check phase2');
     // Next, try to re-resolve the system if
     // there is anything that needs resolving.
     for (i = 0, il = tPhase2References.length; i < il; i++) {
       tReference = tPhase2References[i];
       tValue = tReference.value;
-
-      //console.log('PHASE2', tReference.phase2 !== null, tValue.id);
 
       if (tReference.phase2 === null) {
         // We processed this already. Ignore
@@ -1793,9 +1779,6 @@
           var tBackupKey = pResolver.currentKey;
           //pResolver.currentKey = tReference.reasonKey;
           pResolver.currentKey = tPhase2Data[j].closure.vm.name;
-          if (pResolver.currentKey === '/home/jason/work/lespas-web/src/js/lespas/app.js') {
-            console.log("START HERE YOU FIEND");
-          }
           tPhase2Data[j].closure.executeFunction(tValue, tPhase2Data[j].isNew, tPhase2Data[j].arguments, tReference.binding);
           pResolver.currentKey = tBackupKey;
         }
@@ -1822,6 +1805,7 @@
     var tData;
     var tBackupKey;
     var i, il, j, jl;
+    var tIndex;
 
     for (i = 0, il = tStatsList.length; i < il; i++) {
       tStats = exportStats(tStatsList[i].vm.globalClosure, true, tStatsList[i].key);
@@ -1836,6 +1820,12 @@
       for (j = 0, jl = tStats.exports.length; j < jl; j++) {
         if (tData.exports.indexOf(tStats.exports[j]) === -1) {
           tData.exports.push(tStats.exports[j]);
+
+          tIndex = tData.requires.indexOf(tStats.exports[j]);
+
+          if (tIndex !== -1) {
+            tData.requires.splice(tIndex, 1);
+          }
         }
       }
 

@@ -8,7 +8,7 @@ global.defaultRejsOptions = {
       encoding: 'utf-8'
     });
   },
-  verbosity: 2,
+  verbosity: 1,
   log: function(pVerbosity, pMessage) {
     console.log(pMessage);
   }
